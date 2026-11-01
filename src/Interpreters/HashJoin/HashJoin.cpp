@@ -478,12 +478,22 @@ static HashJoin::Type chooseMethod(const ColumnRawPtrs & key_columns, Sizes & ke
     return Type::hashed;
 }
 
+#if defined(OS_WASM_ISOLATE)
+void throwTwoLevelJoinMapsAreNotAvailable()
+{
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "There are no two-level maps for joins in a WebAssembly isolate");
+}
+#endif
+
 static HashJoin::Type chooseMethod(const ColumnRawPtrs & key_columns, Sizes & key_sizes, bool use_two_level_maps)
 {
-    using Type = HashJoin::Type;
-
     if (!use_two_level_maps)
         return chooseMethod(key_columns, key_sizes);
+
+#if defined(OS_WASM_ISOLATE)
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "There are no two-level maps for joins in a WebAssembly isolate");
+#else
+    using Type = HashJoin::Type;
 
     // if `use_two_level_maps == true` returns two-level version of the map
     switch (auto type = chooseMethod(key_columns, key_sizes))
@@ -509,6 +519,7 @@ static HashJoin::Type chooseMethod(const ColumnRawPtrs & key_columns, Sizes & ke
         default:
             return type;
     }
+#endif
 }
 
 /// If the column is a single non-nullable LowCardinality key, return the dictionary-aware map type
@@ -1709,6 +1720,7 @@ private:
     case HashJoin::Type::TYPE: return fillColumns(*maps.TYPE, columns_right);
             APPLY_FOR_JOIN_VARIANTS(M)
 #undef M
+            JOIN_VARIANTS_SWITCH_END
         }
         UNREACHABLE();
     }
@@ -2229,6 +2241,7 @@ void HashJoin::tryRerangeRightTableDataImpl(Map & map [[maybe_unused]])
     }
                 APPLY_FOR_JOIN_VARIANTS(M)
 #undef M
+                JOIN_VARIANTS_SWITCH_END
             }
         };
         StoredBlocksList sorted_columns;

@@ -1,0 +1,57 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "clickhouse-engine-core",
+  // Not public: the gateway (`packages/gateway`) answers the HTTP interface and calls the engines of this Worker.
+  "workers_dev": false,
+  "main": "src/index.ts",
+  "upload_source_maps": true,
+  "compatibility_date": "2026-10-13",
+  // The static data of the engine, which does not count against the size limit of the Worker. Every request goes
+  // to the Worker: the assets are only read by it, not served.
+  "assets": {
+    "directory": "dist/assets",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  // The catalog of the tables, in a `Coordination` object of this Worker (`packages/coordination`).
+  "durable_objects": {
+    "bindings": [
+      { "name": "COORDINATION", "class_name": "Coordination" },
+      // The engines that keep warm, see `src/host.ts`.
+      { "name": "ENGINE_HOST", "class_name": "EngineHost" }
+    ]
+  },
+  "exports": {
+    "Coordination": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "EngineHost": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    // The engines read parts through `PartCache` (`src/cache.ts`), behind Workers Caching. The default entrypoint is
+    // not cached.
+    "default": { "type": "worker", "cache": { "enabled": false } },
+    "PartCache": { "type": "worker", "cache": { "enabled": true } }
+  },
+  // The merges, from commits and from the Cron Trigger for the TTL, see `MergeMessage`.
+  "queues": {
+    "producers": [{ "binding": "MERGES", "queue": "clickhouse-engine-merges" }],
+    "consumers": [{ "queue": "clickhouse-engine-merges", "max_batch_size": 1, "max_retries": 3 }]
+  },
+  // Deletes the parts that the catalog does not have (`src/garbage.ts`) and queues the merges for the TTL.
+  "triggers": {
+    "crons": ["17 * * * *"]
+  },
+  "vars": {
+    "ENGINE_POOL": "8"
+  },
+  // The parts of the tables.
+  "r2_buckets": [
+    { "binding": "PARTS", "bucket_name": "clickhouse-engine-parts" }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}

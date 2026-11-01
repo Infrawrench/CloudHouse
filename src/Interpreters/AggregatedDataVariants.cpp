@@ -76,6 +76,7 @@ void AggregatedDataVariants::init(Type type_, std::optional<size_t> size_hint)
             break;
         APPLY_FOR_AGGREGATED_VARIANTS(M)
 #undef M
+        AGGREGATED_VARIANTS_SWITCH_END
     }
 
     type = type_;
@@ -95,6 +96,7 @@ size_t AggregatedDataVariants::size() const
             return (NAME)->data.size() + (without_key != nullptr);
         APPLY_FOR_AGGREGATED_VARIANTS(M)
     #undef M
+        AGGREGATED_VARIANTS_SWITCH_END
     }
 }
 
@@ -114,6 +116,7 @@ bool AggregatedDataVariants::topKHeapEverRejected() const
             return (NAME)->top_k_heap.everRejected();
         APPLY_FOR_AGGREGATED_VARIANTS(M)
     #undef M
+        AGGREGATED_VARIANTS_SWITCH_END
     }
 }
 
@@ -130,6 +133,7 @@ bool AggregatedDataVariants::topKHeapInactive() const
             return (NAME)->top_k_heap.willBeInactive();
         APPLY_FOR_AGGREGATED_VARIANTS(M)
     #undef M
+        AGGREGATED_VARIANTS_SWITCH_END
     }
 }
 
@@ -148,6 +152,7 @@ void AggregatedDataVariants::resetAfterStateOwnershipTransfer()
             break;
         APPLY_FOR_AGGREGATED_VARIANTS(M)
     #undef M
+        AGGREGATED_VARIANTS_SWITCH_END
     }
     without_key = nullptr;
     aggregates_pools.clear();
@@ -177,6 +182,7 @@ size_t AggregatedDataVariants::allocatedBytes() const
             break;
         APPLY_FOR_AGGREGATED_VARIANTS(M)
     #undef M
+        AGGREGATED_VARIANTS_SWITCH_END
     }
     return res;
 }
@@ -210,6 +216,7 @@ size_t AggregatedDataVariants::sizeWithoutOverflowRow() const
             return (NAME)->data.size();
         APPLY_FOR_AGGREGATED_VARIANTS(M)
     #undef M
+        AGGREGATED_VARIANTS_SWITCH_END
     }
 }
 
@@ -227,6 +234,7 @@ const char * AggregatedDataVariants::getMethodName() const
             return #NAME;
         APPLY_FOR_AGGREGATED_VARIANTS(M)
     #undef M
+        AGGREGATED_VARIANTS_SWITCH_END
     }
 }
 
@@ -244,8 +252,16 @@ bool AggregatedDataVariants::isTwoLevel() const
             return IS_TWO_LEVEL;
         APPLY_FOR_AGGREGATED_VARIANTS(M)
     #undef M
+        AGGREGATED_VARIANTS_SWITCH_END
     }
 }
+
+#if defined(OS_WASM_ISOLATE)
+void throwTwoLevelVariantsAreNotAvailable()
+{
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "The two-level variants of aggregation are not available in a WebAssembly isolate");
+}
+#endif
 
 bool AggregatedDataVariants::isConvertibleToTwoLevel() const
 {

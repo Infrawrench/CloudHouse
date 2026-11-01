@@ -92,6 +92,7 @@ void releaseHashTable(AggregatedDataVariants & data)
         break;
         APPLY_FOR_AGGREGATED_VARIANTS(M)
 #undef M
+        AGGREGATED_VARIANTS_SWITCH_END
         case AggregatedDataVariants::Type::EMPTY:
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected AggregatedDataVariants type in releaseHashTable");
         case AggregatedDataVariants::Type::without_key:
@@ -259,6 +260,7 @@ void NegativeLimitByTransform::consume(Chunk chunk)
         break;
         APPLY_FOR_AGGREGATED_VARIANTS(M)
 #undef M
+        AGGREGATED_VARIANTS_SWITCH_END
 
         case AggregatedDataVariants::Type::EMPTY:
         case AggregatedDataVariants::Type::without_key:

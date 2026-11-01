@@ -1745,6 +1745,14 @@ using AliasMap = UnorderedMapWithMemoryTracking<std::string_view, std::string_vi
     } \
 
 
+/// The descriptions are the documentation in `system.settings` and the like. A WebAssembly isolate has no room
+/// for them: its code and data have to fit in the size limit of a Worker.
+#if defined(OS_WASM_ISOLATE)
+#    define SETTING_DESCRIPTION_(DESCRIPTION) ""
+#else
+#    define SETTING_DESCRIPTION_(DESCRIPTION) DESCRIPTION
+#endif
+
 /// Generate a FieldInfo entry for a setting without a config path.
 /// Uses typed-array offsets from the constexpr layout.
 /// NOLINTNEXTLINE
@@ -1755,7 +1763,7 @@ using AliasMap = UnorderedMapWithMemoryTracking<std::string_view, std::string_vi
             #NAME, \
             "", \
             #TYPE, \
-            DESCRIPTION, \
+            SETTING_DESCRIPTION_(DESCRIPTION), \
             static_cast<UInt64>(FLAGS), \
             &settingFieldOps<SettingField##TYPE>(), \
             offsetof(Data, TYPE##_) + Traits_::settings_layout_.local_index[static_cast<size_t>(Traits_::SettingID_::NAME)] * sizeof(SettingField##TYPE), \
@@ -1770,7 +1778,7 @@ using AliasMap = UnorderedMapWithMemoryTracking<std::string_view, std::string_vi
             #NAME, \
             PATH, \
             #TYPE, \
-            DESCRIPTION, \
+            SETTING_DESCRIPTION_(DESCRIPTION), \
             static_cast<UInt64>(FLAGS), \
             &settingFieldOps<SettingField##TYPE>(), \
             offsetof(Data, TYPE##_) + Traits_::settings_layout_.local_index[static_cast<size_t>(Traits_::SettingID_::NAME)] * sizeof(SettingField##TYPE), \

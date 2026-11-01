@@ -296,7 +296,7 @@ FiltersForTableExpressionMap collectFiltersForAnalysis(const QueryTreeNodePtr & 
             return true;
         if (typeid_cast<const StorageView *>(raw))
             return true;
-        return false;
+        return storage_ptr->needsFiltersForQueryProcessingStage();
     };
 
     for (const auto & table_expression : table_nodes)

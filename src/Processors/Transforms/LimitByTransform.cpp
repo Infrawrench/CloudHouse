@@ -258,6 +258,7 @@ void LimitByTransform::transform(Chunk & chunk)
         break;
             APPLY_FOR_AGGREGATED_VARIANTS(M)
 #undef M
+            AGGREGATED_VARIANTS_SWITCH_END
 
             case AggregatedDataVariants::Type::EMPTY:
             case AggregatedDataVariants::Type::without_key:

@@ -13,7 +13,13 @@ namespace PerCPU
 /// Hard upper bound on the kernel cpu_id we'll route to. The BSS-backed per-CPU storage in
 /// callers is sized with this constant, so it must be a compile-time value — but only the
 /// first `getNumCPUs()` shards are used at runtime (and only those get faulted in).
+/// A single-threaded isolate has one CPU, and the rows for the others (14 MiB in `ProfileEvents` alone)
+/// would have to fit in its small, fixed linear memory.
+#if defined(OS_WASM_ISOLATE)
+constexpr UInt32 MAX_CPUS = 1;
+#else
 constexpr UInt32 MAX_CPUS = 1024;
+#endif
 
 /// Sanity bound on the possible-CPU count, so that a malformed sysfs file cannot make dynamically
 /// sized per-CPU storage huge. The largest `CONFIG_NR_CPUS` the kernel accepts on any architecture.

@@ -325,7 +325,9 @@ BackgroundSchedulePool::BackgroundSchedulePool(size_t size_, size_t initial_size
                 spawnThreadLocked();
         }
 
+#if !defined(OS_WASM_ISOLATE)
         delayed_thread = std::make_unique<ThreadFromGlobalPoolNoTracingContextPropagation>([this] { delayExecutionThreadFunction(); });
+#endif
     }
     catch (...)
     {
@@ -347,6 +349,10 @@ BackgroundSchedulePool::BackgroundSchedulePool(size_t size_, size_t initial_size
 
 void BackgroundSchedulePool::spawnThreadLocked()
 {
+#if defined(OS_WASM_ISOLATE)
+    /// A single-threaded isolate has no threads to run tasks on: a worker would be a job that never
+    /// returns. The tasks stay queued.
+#else
     /// `emplace_back` may reallocate `threads`. If that reallocation throws (e.g. out of memory)
     /// after the joinable `ThreadFromGlobalPoolNoTracingContextPropagation` temporary has been
     /// constructed — and so the worker thread already started — unwinding destroys that still
@@ -359,6 +365,7 @@ void BackgroundSchedulePool::spawnThreadLocked()
         threads.reserve(threads.size() < max_size ? max_size : threads.size() + 1);
 
     threads.emplace_back(ThreadFromGlobalPoolNoTracingContextPropagation([this] { threadFunction(); }));
+#endif
 }
 
 

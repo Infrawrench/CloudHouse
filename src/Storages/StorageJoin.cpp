@@ -398,6 +398,7 @@ std::optional<UInt64> StorageJoin::totalRows(ContextPtr query_context) const
             break;
         APPLY_FOR_JOIN_VARIANTS(M)
 #undef M
+        JOIN_VARIANTS_SWITCH_END
     }
     return rows;
 }

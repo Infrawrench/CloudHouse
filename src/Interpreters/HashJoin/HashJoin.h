@@ -29,6 +29,14 @@
 namespace DB
 {
 
+/// Ends a switch over `APPLY_FOR_JOIN_VARIANTS`: in a WebAssembly isolate, it does not cover the two-level maps.
+#if defined(OS_WASM_ISOLATE)
+#    define JOIN_VARIANTS_SWITCH_END default: throwTwoLevelJoinMapsAreNotAvailable();
+[[noreturn]] void throwTwoLevelJoinMapsAreNotAvailable();
+#else
+#    define JOIN_VARIANTS_SWITCH_END
+#endif
+
 class TableJoin;
 class ExpressionActions;
 using Sizes = std::vector<size_t>;
@@ -243,8 +251,8 @@ public:
 
     const ColumnWithTypeAndName & rightAsofKeyColumn() const;
 
-    /// Different types of keys for maps.
-    #define APPLY_FOR_JOIN_VARIANTS(M) \
+    /// Different types of keys for maps. All the types of `Type`; the code is instantiated for `APPLY_FOR_JOIN_VARIANTS`.
+    #define APPLY_FOR_ALL_JOIN_VARIANTS(M) \
         M(key8)                        \
         M(key16)                       \
         M(key32)                       \
@@ -276,6 +284,35 @@ public:
         M(range17_key64)               \
         M(range18_key64)
 
+#if defined(OS_WASM_ISOLATE)
+    /// A WebAssembly isolate has one thread, and the two-level maps are for `ConcurrentHashJoin`. Without instances
+    /// of them, the code fits in the size limit of a Worker.
+    #define APPLY_FOR_JOIN_VARIANTS(M) \
+        M(key8)                        \
+        M(key16)                       \
+        M(key32)                       \
+        M(key64)                       \
+        M(key_string)                  \
+        M(key_fixed_string)            \
+        M(keys32)                      \
+        M(keys64)                      \
+        M(keys128)                     \
+        M(keys256)                     \
+        M(hashed)                      \
+        M(low_cardinality_key_string)       \
+        M(low_cardinality_key_fixed_string) \
+        M(range8_key32)                \
+        M(range16_key32)               \
+        M(range17_key32)               \
+        M(range18_key32)               \
+        M(range8_key64)                \
+        M(range16_key64)               \
+        M(range17_key64)               \
+        M(range18_key64)
+#else
+    #define APPLY_FOR_JOIN_VARIANTS(M) APPLY_FOR_ALL_JOIN_VARIANTS(M)
+#endif
+
     /// Used for reading from StorageJoin and applying joinGet function. The single-LowCardinality-key
     /// maps store key values in maps physically identical to their non-LowCardinality counterparts, so
     /// they are read back the same way (the output key column is the parent LowCardinality type).
@@ -296,7 +333,12 @@ public:
         M(low_cardinality_key_fixed_string)
 
     /// Used in ConcurrentHashJoin
-    #define APPLY_FOR_TWO_LEVEL_JOIN_VARIANTS(M, ...)           \
+#if defined(OS_WASM_ISOLATE)
+    #define APPLY_FOR_TWO_LEVEL_JOIN_VARIANTS(M, ...)
+#else
+    #define APPLY_FOR_TWO_LEVEL_JOIN_VARIANTS(M, ...) APPLY_FOR_ALL_TWO_LEVEL_JOIN_VARIANTS(M __VA_OPT__(,) __VA_ARGS__)
+#endif
+    #define APPLY_FOR_ALL_TWO_LEVEL_JOIN_VARIANTS(M, ...)           \
         M(two_level_key32 __VA_OPT__(,) __VA_ARGS__)            \
         M(two_level_key64 __VA_OPT__(,) __VA_ARGS__)            \
         M(two_level_key_string __VA_OPT__(,) __VA_ARGS__)       \
@@ -314,7 +356,7 @@ public:
     enum class Type : uint8_t
     {
         #define M(NAME) NAME,
-            APPLY_FOR_JOIN_VARIANTS(M)
+            APPLY_FOR_ALL_JOIN_VARIANTS(M)
         #undef M
     };
 
@@ -433,6 +475,7 @@ public:
 
                 APPLY_FOR_JOIN_VARIANTS(M)
             #undef M
+                JOIN_VARIANTS_SWITCH_END
             }
         }
 
@@ -444,6 +487,7 @@ public:
                 case Type::NAME: return NAME ? NAME->size() : 0;
                 APPLY_FOR_JOIN_VARIANTS(M)
             #undef M
+                JOIN_VARIANTS_SWITCH_END
             }
         }
 
@@ -455,6 +499,7 @@ public:
                 case Type::NAME: return NAME ? NAME->getBufferSizeInBytes() : 0;
                 APPLY_FOR_JOIN_VARIANTS(M)
             #undef M
+                JOIN_VARIANTS_SWITCH_END
             }
         }
 
@@ -466,6 +511,7 @@ public:
                 case Type::NAME: return NAME ? NAME->getBufferSizeInCells() : 0;
                 APPLY_FOR_JOIN_VARIANTS(M)
             #undef M
+                JOIN_VARIANTS_SWITCH_END
             }
         }
 

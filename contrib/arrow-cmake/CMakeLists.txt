@@ -97,7 +97,9 @@ endif()
 # version they were produced with, so regenerate them with our `flatc`. The flags are from Arrow's
 # `cpp/build-support/update-flatbuffers.sh`, minus `--scoped-enums`, which Arrow's code does not use.
 
-if (NOT CMAKE_HOST_SYSTEM_NAME STREQUAL CMAKE_SYSTEM_NAME OR NOT CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL CMAKE_SYSTEM_PROCESSOR OR USE_MUSL)
+if (HOST_FLATC)
+    set(FLATC_EXECUTABLE "${HOST_FLATC}")
+elseif (NOT CMAKE_HOST_SYSTEM_NAME STREQUAL CMAKE_SYSTEM_NAME OR NOT CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL CMAKE_SYSTEM_PROCESSOR OR USE_MUSL)
     set(FLATC_EXECUTABLE "${PROJECT_BINARY_DIR}/native/contrib/flatbuffers-cmake/flatc")
 else ()
     set(FLATC_EXECUTABLE $<TARGET_FILE:flatc>)
@@ -718,7 +720,10 @@ add_definitions(-DPARQUET_THRIFT_VERSION_MAJOR=0)
 add_definitions(-DPARQUET_THRIFT_VERSION_MINOR=16)
 
 # As per https://github.com/apache/arrow/pull/35672 you need to enable it explicitly.
-add_definitions(-DARROW_ENABLE_THREADING)
+# An isolate has no threads: without this, Arrow runs its tasks serially.
+if (NOT WASM_ISOLATE)
+    add_definitions(-DARROW_ENABLE_THREADING)
+endif()
 
 # === tools
 

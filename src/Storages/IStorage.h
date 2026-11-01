@@ -175,6 +175,10 @@ public:
     /// Returns true if the storage supports queries with the PREWHERE section.
     virtual bool supportsPrewhere() const { return false; }
 
+    /// Returns true if `getQueryProcessingStage` uses `SelectQueryInfo::filter_actions_dag`, so that the planner
+    /// collects the filters for the table before it asks (see `collectFiltersForAnalysis`).
+    virtual bool needsFiltersForQueryProcessingStage() const { return false; }
+
     virtual ConditionSelectivityEstimatorPtr getConditionSelectivityEstimator(const RangesInDataParts &, const Names &, ContextPtr) const;
 
     /// Returns which columns supports PREWHERE, or empty std::nullopt if all columns is supported.

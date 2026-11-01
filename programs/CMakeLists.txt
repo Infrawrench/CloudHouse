@@ -132,6 +132,10 @@ if (ENABLE_CLICKHOUSE_SELF_EXTRACTING AND NOT ENABLE_DUMMY_LAUNCHERS)
     add_subdirectory (self-extracting)
 endif ()
 
+if (WASM_ISOLATE)
+    add_subdirectory (isolate)
+endif ()
+
 clickhouse_add_executable (clickhouse main.cpp)
 
 # A library that prevent usage of several functions from libc.

@@ -234,6 +234,7 @@ void HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::insertFromBlockImpl(
 
             APPLY_FOR_JOIN_VARIANTS(M)
 #undef M
+            JOIN_VARIANTS_SWITCH_END
     }
 }
 
@@ -384,6 +385,7 @@ size_t HashJoinMethods<KIND, STRICTNESS, MapsTemplate>::switchJoinRightColumns(
     }
             APPLY_FOR_JOIN_VARIANTS(M)
 #undef M
+            JOIN_VARIANTS_SWITCH_END
 
     }
 }

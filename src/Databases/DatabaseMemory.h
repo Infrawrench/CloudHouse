@@ -52,6 +52,16 @@ public:
 
     void alterTable(ContextPtr local_context, const StorageID & table_id, const StorageInMemoryMetadata & metadata, bool validate_new_create_query) override;
 
+    /// Renames a table within this database or into another `Memory` database, or exchanges two tables. Not for tables
+    /// that store data on disk, whose data path is their name.
+    void renameTable(
+        ContextPtr local_context,
+        const String & table_name,
+        IDatabase & to_database,
+        const String & to_table_name,
+        bool exchange,
+        bool dictionary) override;
+
     std::vector<std::pair<ASTPtr, StoragePtr>> getTablesForBackup(const FilterByNameFunction & filter, const ContextPtr & local_context) const override;
 
 protected:
@@ -60,6 +70,8 @@ protected:
 private:
     void removeDataPath(ContextPtr local_context);
     void checkMetadataFilenameAvailabilityUnlocked(const String & table_name) const TSA_REQUIRES(mutex);
+    /// Detaches a table for `renameTable`, and returns its definition, renamed to `new_id`.
+    ASTPtr detachTableForRename(const String & table_name, const StorageID & new_id);
 
     const String data_path;
     using NameToASTCreate = std::unordered_map<String, ASTPtr>;

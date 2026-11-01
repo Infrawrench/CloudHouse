@@ -204,7 +204,8 @@ struct AggregatedDataVariants : private boost::noncopyable
     std::unique_ptr<AggregationMethodKeysFixed<AggregatedDataWithKeys256TwoLevel, false, true>> low_cardinality_keys256_two_level;
 
     /// In this and similar macros, the option without_key is not considered.
-    #define APPLY_FOR_AGGREGATED_VARIANTS(M) \
+    /// All the types of `Type`. The code is instantiated for `APPLY_FOR_AGGREGATED_VARIANTS`, which may have fewer.
+    #define APPLY_FOR_ALL_AGGREGATED_VARIANTS(M) \
         M(key8,                       false) \
         M(key16,                      false) \
         M(key32,                      false) \
@@ -313,7 +314,36 @@ struct AggregatedDataVariants : private boost::noncopyable
         M(low_cardinality_key_string_two_level, true) \
         M(low_cardinality_key_fixed_string_two_level, true) \
 
-    #define APPLY_FOR_VARIANTS_CONVERTIBLE_TO_TWO_LEVEL(M) \
+    /// Ends a switch over `APPLY_FOR_AGGREGATED_VARIANTS`: in an isolate, it does not cover the two-level variants.
+#if defined(OS_WASM_ISOLATE)
+    #define AGGREGATED_VARIANTS_SWITCH_END default: throwTwoLevelVariantsAreNotAvailable();
+#else
+    #define AGGREGATED_VARIANTS_SWITCH_END
+#endif
+
+#if defined(OS_WASM_ISOLATE)
+    /// A WebAssembly isolate has one thread, and the two-level variants are for aggregating and merging in parallel.
+    /// Without instances of them, the code fits in the size limit of a Worker. Their types stay in `Type`, but no
+    /// table is ever converted to them. The sites that use these macros all name their macro `M`, which the filter
+    /// applies to the single-level variants only.
+    #define AGGREGATED_VARIANT_IF_SINGLE_LEVEL_false(NAME) M(NAME, false)
+    #define AGGREGATED_VARIANT_IF_SINGLE_LEVEL_true(NAME)
+    #define AGGREGATED_VARIANT_IF_SINGLE_LEVEL(NAME, IS_TWO_LEVEL) AGGREGATED_VARIANT_IF_SINGLE_LEVEL_##IS_TWO_LEVEL(NAME)
+    #define APPLY_FOR_AGGREGATED_VARIANTS(M_) APPLY_FOR_ALL_AGGREGATED_VARIANTS(AGGREGATED_VARIANT_IF_SINGLE_LEVEL)
+    #define APPLY_FOR_VARIANTS_CONVERTIBLE_TO_TWO_LEVEL(M)
+    #define APPLY_FOR_VARIANTS_TWO_LEVEL(M)
+    #define APPLY_FOR_LOW_CARDINALITY_VARIANTS(M) APPLY_FOR_SINGLE_LEVEL_LOW_CARDINALITY_VARIANTS(M)
+#else
+    #define APPLY_FOR_AGGREGATED_VARIANTS(M) APPLY_FOR_ALL_AGGREGATED_VARIANTS(M)
+    #define APPLY_FOR_VARIANTS_CONVERTIBLE_TO_TWO_LEVEL(M) APPLY_FOR_VARIANTS_WITH_TWO_LEVEL_TWIN(M)
+    #define APPLY_FOR_VARIANTS_TWO_LEVEL(M) APPLY_FOR_ALL_VARIANTS_TWO_LEVEL(M)
+    #define APPLY_FOR_LOW_CARDINALITY_VARIANTS(M) \
+        APPLY_FOR_SINGLE_LEVEL_LOW_CARDINALITY_VARIANTS(M) \
+        APPLY_FOR_TWO_LEVEL_LOW_CARDINALITY_VARIANTS(M)
+#endif
+
+    /// The single-level variants that have a two-level twin, `NAME##_two_level`.
+    #define APPLY_FOR_VARIANTS_WITH_TWO_LEVEL_TWIN(M) \
         M(key32)            \
         M(key64)            \
         M(key32_void)       \
@@ -389,10 +419,10 @@ struct AggregatedDataVariants : private boost::noncopyable
     /// NOLINTNEXTLINE
     #define APPLY_FOR_VARIANTS_SINGLE_LEVEL(M) \
         APPLY_FOR_VARIANTS_NOT_CONVERTIBLE_TO_TWO_LEVEL(M) \
-        APPLY_FOR_VARIANTS_CONVERTIBLE_TO_TWO_LEVEL(M) \
+        APPLY_FOR_VARIANTS_WITH_TWO_LEVEL_TWIN(M) \
 
     /// NOLINTNEXTLINE
-    #define APPLY_FOR_VARIANTS_TWO_LEVEL(M) \
+    #define APPLY_FOR_ALL_VARIANTS_TWO_LEVEL(M) \
         M(key32_two_level)            \
         M(key64_two_level)            \
         M(key32_void_two_level)       \
@@ -433,7 +463,7 @@ struct AggregatedDataVariants : private boost::noncopyable
         M(low_cardinality_key_string_two_level) \
         M(low_cardinality_key_fixed_string_two_level) \
 
-    #define APPLY_FOR_LOW_CARDINALITY_VARIANTS(M) \
+    #define APPLY_FOR_SINGLE_LEVEL_LOW_CARDINALITY_VARIANTS(M) \
         M(low_cardinality_key8) \
         M(low_cardinality_key16) \
         M(low_cardinality_key32) \
@@ -441,7 +471,9 @@ struct AggregatedDataVariants : private boost::noncopyable
         M(low_cardinality_keys128) \
         M(low_cardinality_keys256) \
         M(low_cardinality_key_string) \
-        M(low_cardinality_key_fixed_string) \
+        M(low_cardinality_key_fixed_string)
+
+    #define APPLY_FOR_TWO_LEVEL_LOW_CARDINALITY_VARIANTS(M) \
         M(low_cardinality_key32_two_level) \
         M(low_cardinality_key64_two_level) \
         M(low_cardinality_keys128_two_level) \
@@ -455,7 +487,7 @@ struct AggregatedDataVariants : private boost::noncopyable
         without_key,
 
     #define M(NAME, IS_TWO_LEVEL) NAME,
-        APPLY_FOR_AGGREGATED_VARIANTS(M)
+        APPLY_FOR_ALL_AGGREGATED_VARIANTS(M)
     #undef M
     };
     Type type = Type::EMPTY;
@@ -552,6 +584,10 @@ struct AggregatedDataVariants : private boost::noncopyable
 using AggregatedDataVariantsPtr = std::shared_ptr<AggregatedDataVariants>;
 using ManyAggregatedDataVariants = std::vector<AggregatedDataVariantsPtr>;
 using ManyAggregatedDataVariantsPtr = std::shared_ptr<ManyAggregatedDataVariants>;
+
+#if defined(OS_WASM_ISOLATE)
+[[noreturn]] void throwTwoLevelVariantsAreNotAvailable();
+#endif
 
 /// The two-level twin of a convertible variant type; other types map to themselves.
 inline AggregatedDataVariants::Type convertToTwoLevelTypeIfPossible(AggregatedDataVariants::Type type)

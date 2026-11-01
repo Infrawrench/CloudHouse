@@ -33,6 +33,13 @@ if (NOT ENABLE_PARQUET)
     return()
 endif()
 
+# A `flatc` for the host, built outside of this build, for a cross-compile that cannot have a native sub-build: the
+# sub-build is configured with the compiler of the target, which for WebAssembly is Emscripten.
+set (HOST_FLATC "" CACHE FILEPATH "A flatc that runs on the host, instead of the one of the native sub-build")
+if (HOST_FLATC)
+    return()
+endif()
+
 # === flatc
 #
 # Generated FlatBuffers code contains a `static_assert` on `FLATBUFFERS_VERSION_MAJOR`/`MINOR`/

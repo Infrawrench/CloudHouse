@@ -11,7 +11,9 @@ set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
 
 # Control maximum size of stack frames. It can be important if the code is run in fibers with small stack size.
 # Only in release build because debug has too large stack frames.
-if ((NOT CMAKE_BUILD_TYPE_UC STREQUAL "DEBUG") AND (NOT SANITIZE))
+# The single-threaded isolate build has no fibers, and at `-Oz` some registration functions, which build the
+# documentation of dozens of functions in one frame, go above the limit.
+if ((NOT CMAKE_BUILD_TYPE_UC STREQUAL "DEBUG") AND (NOT SANITIZE) AND (NOT WASM_ISOLATE))
     add_warning(frame-larger-than=65536)
 endif ()
 
@@ -44,6 +46,20 @@ no_warning(unsafe-buffer-usage) # too aggressive
 no_warning(switch-default) # conflicts with "defaults in a switch covering all enum values"
 no_warning(nrvo) # not eliding copy on return - too aggressive
 no_warning(missing-noreturn) # too aggressive with no clear benefit, see https://github.com/ClickHouse/ClickHouse/pull/86416
+if (WASM_ISOLATE)
+    # The isolate build leaves the two-level variants of aggregation and joins out of the macros that instantiate
+    # them, which empties the functions that only deal with them. The native build keeps these warnings.
+    no_warning(unused-parameter)
+    no_warning(unused-variable)
+    no_warning(unused-macros)
+    no_warning(unused-lambda-capture)
+    no_warning(unused-local-typedef)
+    no_warning(unused-function)
+    no_warning(unused-member-function)
+    no_warning(unneeded-member-function)
+    no_warning(unreachable-code)
+    no_warning(unreachable-code-return)
+endif ()
 # -Wunique-object-duplication is enabled: a mutable object defined in a header, with external
 # linkage and hidden visibility, gets one copy per shared object rather than one per process, so
 # any "singleton" declared that way silently stops being one. It only has anything to report under

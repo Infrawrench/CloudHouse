@@ -22,6 +22,11 @@
 #include <Poco/Util/LayeredConfiguration.h>
 #include <base/demangle.h>
 
+/// In a single-threaded isolate `scheduleImpl` runs jobs inline, and the helpers of the queue are not used.
+#if defined(OS_WASM_ISOLATE)
+#pragma clang diagnostic ignored "-Wunused-member-function"
+#endif
+
 namespace DB
 {
     namespace ErrorCodes
@@ -426,6 +431,46 @@ ReturnType ThreadPoolImpl<Thread>::scheduleImpl(Job job, Priority priority, std:
             return false;
     };
 
+#if defined(OS_WASM_ISOLATE)
+    /// There are no threads: run the job on the calling thread before returning. Mutexes are no-ops in
+    /// a single-threaded build, so a job may take a lock its caller holds. The job runs with a
+    /// `ThreadStatus` of its own, as on a worker thread, and the caller's is restored afterwards.
+    UNUSED(priority, wait_microseconds, propagate_opentelemetry_tracing_context);
+    if (finished)
+        return on_error("finished");
+
+    /// The jobs of the global pool are the bodies of `ThreadFromGlobalPool`. Unlike a job, the body of a
+    /// thread may wait for its creator, so it cannot run inline: whatever needs a thread fails instead.
+    if constexpr (std::is_same_v<Thread, GlobalThreadType>)
+        return on_error("there are no threads in a WebAssembly isolate");
+
+    std::exception_ptr exception_from_job;
+    {
+        DB::ThreadStatus * caller_thread_status = DB::current_thread;
+        DB::current_thread = nullptr;
+        SCOPE_EXIT(DB::current_thread = caller_thread_status);
+        try
+        {
+            DB::ThreadStatus thread_status;
+            job();
+        }
+        catch (...)
+        {
+            exception_from_job = std::current_exception();
+        }
+    }
+
+    if (exception_from_job)
+    {
+        std::lock_guard lock(mutex);
+        if (!first_exception)
+            first_exception = exception_from_job;
+        if (shutdown_on_exception)
+            finished = true;
+    }
+
+    return static_cast<ReturnType>(true);
+#else
     // Decrement available_threads, scoped to the job lifecycle.
     // This ensures that available_threads decreases when a new job starts
     // and automatically increments when the job completes or goes out of scope.
@@ -590,6 +635,7 @@ ReturnType ThreadPoolImpl<Thread>::scheduleImpl(Job job, Priority priority, std:
     ProfileEvents::increment(std::is_same_v<Thread, GlobalThreadType> ? ProfileEvents::GlobalThreadPoolJobs : ProfileEvents::LocalThreadPoolJobs);
 
     return static_cast<ReturnType>(true);
+#endif
 }
 
 template <typename Thread>

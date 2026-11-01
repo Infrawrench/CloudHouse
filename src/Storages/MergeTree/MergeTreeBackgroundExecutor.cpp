@@ -89,8 +89,12 @@ MergeTreeBackgroundExecutor<Queue>::MergeTreeBackgroundExecutor(
     pool->setMaxFreeThreads(std::max(1UL, threads_count));
     pool->setQueueSize(std::max(1UL, threads_count));
 
+#if !defined(OS_WASM_ISOLATE)
+    /// A WebAssembly isolate has no threads, and its pools run a job inline, so the loop of a worker would never
+    /// return. It has no merges either: an executor only answers what it would allow.
     for (size_t number = 0; number < threads_count; ++number)
         pool->scheduleOrThrowOnError([this] { threadFunction(); });
+#endif
 }
 
 template <class Queue>
@@ -166,8 +170,10 @@ void MergeTreeBackgroundExecutor<Queue>::increaseThreadsAndMaxTasksCount(size_t 
     pool->setMaxFreeThreads(std::max(1UL, new_threads_count));
     pool->setQueueSize(std::max(1UL, new_threads_count));
 
+#if !defined(OS_WASM_ISOLATE)
     for (size_t number = threads_count; number < new_threads_count; ++number)
         pool->scheduleOrThrowOnError([this] { threadFunction(); });
+#endif
 
     max_tasks_metric.changeTo(new_max_tasks_count);
     max_tasks_count.store(new_max_tasks_count, std::memory_order_relaxed);

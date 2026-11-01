@@ -1,0 +1,22 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "coordination",
+  "main": "src/index.ts",
+  "upload_source_maps": true,
+  "compatibility_date": "2026-10-13",
+  "observability": {
+    "enabled": true
+  },
+  // One `Coordination` object per cluster, addressed by `idFromName(cluster)`.
+  "durable_objects": {
+    "bindings": [
+      { "name": "COORDINATION", "class_name": "Coordination" }
+    ]
+  },
+  "exports": {
+    "Coordination": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}

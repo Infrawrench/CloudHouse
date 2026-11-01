@@ -1,0 +1,20 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  // The public Worker: the HTTP interface, with the engines of `clickhouse-engine-core` behind it. It has no module of
+  // the engine in its bundle, so that a new isolate of it starts in milliseconds.
+  "name": "clickhouse-engine",
+  "main": "src/index.ts",
+  "upload_source_maps": true,
+  "compatibility_date": "2026-10-13",
+  "durable_objects": {
+    "bindings": [
+      { "name": "ENGINES", "class_name": "EngineHost", "script_name": "clickhouse-engine-core" }
+    ]
+  },
+  "vars": {
+    "ENGINE_POOL": "8"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

@@ -751,6 +751,7 @@ static IColumn::Selector selectDispatchBlock(const HashJoin & join, size_t num_s
 
             APPLY_FOR_JOIN_VARIANTS(M)
 #undef M
+            JOIN_VARIANTS_SWITCH_END
         }
         UNREACHABLE();
     };

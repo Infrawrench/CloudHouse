@@ -1,0 +1,44 @@
+# The objects that `cut-dead-code.py` links `clickhouse-isolate` without, as regular expressions of their paths in
+# the build. An isolate has the storages and databases that `registerIsolate.cpp` registers, and no disks, Keeper,
+# clusters, replicas or object storages.
+
+# MergeTree, except what `ObjectMergeTree` uses: keys, partitions, settings, TTL, data skipping indexes, and splitting
+# a block into partitions, and `MergeTreeData`, whose virtual columns projections have. The planner and DDL refer to
+# parallel replicas and to `DDLTask` on every query, so they stay.
+/Storages/MergeTree/(?!MergeTreeData\.cpp|MergeTreeSplitPrewhereIntoReadSteps|InsertBlockInfo|MergeTreeBackgroundExecutor|KeyCondition|MergeTreePartition|MergeTreeSettings|MergeTreeIndex|MergeTreeIndices|MergeTreeDataWriter|BoolMask|RPNBuilder|MergeTreeDataPartTTLInfo|PartitionPruner|ApproximateNearestNeighborIndexesCommon|GinIndexStore|ITokenExtractor|IndexTypes|MergeTreeWhereOptimizer|MergeTreeDataFormatVersion|MarkRange|ColumnSizeEstimator|RangesInDataPart|PrimaryIndexCache|MergeTreeVirtualColumns|VectorSearchUtils|TokenExtractors|TextIndexUtils|MergeTreeIOSettings|IPartMetadataManager)[^/]*\.o$
+/Storages/MergeTree/Compaction/
+/Storages/MergeTree/Streaming/
+/Storages/StorageReplicatedMergeTree\.cpp\.o$
+/Storages/StorageMergeTree\.cpp\.o$
+/Storages/MergeTree/registerStorageMergeTree\.cpp\.o$
+
+# Distributed tables, clusters and parallel replicas.
+/Storages/Distributed/
+/Storages/StorageDistributed\.cpp\.o$
+/Storages/StorageCluster\w*\.cpp\.o$
+/Interpreters/Cluster(Discovery)?\.cpp\.o$
+/Interpreters/DDLWorker\.cpp\.o$
+/Interpreters/executeDDLQueryOnCluster\.cpp\.o$
+/Interpreters/ClusterProxy/
+/Processors/QueryPlan/ReadFromRemote\.cpp\.o$
+/Processors/QueryPlan/DistributedPlanExecutor\.cpp\.o$
+/QueryPipeline/RemoteQueryExecutor\w*\.cpp\.o$
+/Storages/MergeTree/ParallelReplicas\w*\.cpp\.o$
+
+# Keeper, replication, backups.
+/Common/ZooKeeper/.*/(?!ZooKeeperCommon)[^/]*\.o$
+/Storages/StorageKeeperMap\.cpp\.o$
+/Backups/
+/Databases/DatabaseReplicated\w*\.cpp\.o$
+
+# Object storages, data lakes, HTTP sources, caches on disk.
+/Storages/ObjectStorage/
+/Disks/ObjectStorages/
+/Disks/IO/CachedOnDisk\w*\.cpp\.o$
+/IO/S3/
+/Storages/StorageURL\.cpp\.o$
+/IO/HTTPConnectionPool\.cpp\.o$
+/IO/ReadWriteBufferFromHTTP\.cpp\.o$
+
+# The fuzzer of queries, and the cache of query results.
+/Common/QueryFuzzer\w*\.cpp\.o$

@@ -1314,6 +1314,12 @@ bool allowParallelHashJoin(
     bool is_special_storage,
     bool one_disjunct)
 {
+#if defined(OS_WASM_ISOLATE)
+    /// `ConcurrentHashJoin` builds two-level maps to merge the maps of its threads, and an isolate has neither: with
+    /// one thread, `parallel_hash` is `hash`.
+    UNUSED(join_algorithms, kind, is_special_storage, one_disjunct);
+    return false;
+#else
     if (std::ranges::none_of(join_algorithms, [](auto algo) { return algo == JoinAlgorithm::PARALLEL_HASH; }))
         return false;
     if (kind != JoinKind::Left && kind != JoinKind::Inner
@@ -1322,5 +1328,6 @@ bool allowParallelHashJoin(
     if (is_special_storage || !one_disjunct)
         return false;
     return true;
+#endif
 }
 }

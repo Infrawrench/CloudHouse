@@ -436,7 +436,9 @@ endif()
 # every `src/` library plus the libFuzzer and Address Sanitizer runtimes into one image already just
 # under the 2 GiB reach of `R_X86_64_PC32`, which the extra prologues push over; the fuzzers are never
 # shipped, and Address Sanitizer reports stack buffer overflows earlier and in more detail than an abort.
-if (NOT ENABLE_FUZZING)
+# The isolate build, which has to fit the 64 MiB of a Worker, goes without: in WebAssembly the return addresses are not in
+# linear memory, so the canary guards no control flow there.
+if (NOT ENABLE_FUZZING AND NOT WASM_ISOLATE)
     set (COMPILER_FLAGS "${COMPILER_FLAGS} -fstack-protector-strong")
 endif()
 

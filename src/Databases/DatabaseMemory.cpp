@@ -11,15 +11,22 @@
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/quoteString.h>
 #include <Storages/IStorage.h>
+#include <Core/Settings.h>
 #include <Core/UUID.h>
 
 namespace DB
 {
 
+namespace Setting
+{
+    extern const SettingsSeconds lock_acquire_timeout;
+}
+
 namespace ErrorCodes
 {
     extern const int UNKNOWN_TABLE;
     extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
     extern const int TABLE_ALREADY_EXISTS;
 }
 
@@ -102,6 +109,87 @@ void DatabaseMemory::dropTable(
     UUID table_uuid = table->getStorageID().uuid;
     if (table_uuid != UUIDHelpers::Nil)
         DatabaseCatalog::instance().removeUUIDMappingFinally(table_uuid);
+}
+
+void DatabaseMemory::renameTable(
+    ContextPtr local_context,
+    const String & table_name,
+    IDatabase & to_database,
+    const String & to_table_name,
+    bool exchange,
+    bool dictionary)
+{
+    if (dictionary)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Database {} does not support renaming dictionaries", getEngineName());
+    auto * to_memory = typeid_cast<DatabaseMemory *>(&to_database);
+    if (!to_memory)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Cannot move a table from a database of engine {} to one of engine {}",
+            getEngineName(), to_database.getEngineName());
+
+    ensurePopulated();
+    to_memory->ensurePopulated();
+    auto get_table = [&](DatabaseMemory & database, const String & name)
+    {
+        StoragePtr table = database.getTable(name, local_context);
+        if (table->storesDataOnDisk())
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Database {} cannot rename table {}, which stores data on disk",
+                getEngineName(), backQuote(name));
+        return table;
+    };
+
+    StoragePtr table = get_table(*this, table_name);
+    const StorageID new_id{to_database.getDatabaseName(), to_table_name, table->getStorageID().uuid};
+    table->checkTableCanBeRenamed(new_id);
+    StoragePtr other_table;
+    StorageID other_new_id = StorageID::createEmpty();
+    if (exchange)
+    {
+        other_table = get_table(*to_memory, to_table_name);
+        other_new_id = StorageID{getDatabaseName(), table_name, other_table->getStorageID().uuid};
+        other_table->checkTableCanBeRenamed(other_new_id);
+    }
+    else
+    {
+        if (to_memory->isTableExist(to_table_name, local_context))
+            throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS, "Table {}.{} already exists",
+                backQuote(new_id.database_name), backQuote(new_id.table_name));
+        to_memory->checkMetadataFilenameAvailability(to_table_name);
+    }
+
+    const auto lock_timeout = local_context->getSettingsRef()[Setting::lock_acquire_timeout];
+    auto table_lock = table->lockExclusively(local_context->getCurrentQueryId(), lock_timeout);
+    TableExclusiveLockHolder other_table_lock;
+    if (other_table)
+        other_table_lock = other_table->lockExclusively(local_context->getCurrentQueryId(), lock_timeout);
+
+    ASTPtr create_query = detachTableForRename(table_name, new_id);
+    ASTPtr other_create_query = other_table ? to_memory->detachTableForRename(to_table_name, other_new_id) : nullptr;
+    table->renameInMemory(new_id);
+    if (other_table)
+        other_table->renameInMemory(other_new_id);
+    to_memory->createTable(local_context, new_id.table_name, table, create_query);
+    if (other_table)
+        createTable(local_context, other_new_id.table_name, other_table, other_create_query);
+}
+
+ASTPtr DatabaseMemory::detachTableForRename(const String & table_name, const StorageID & new_id)
+{
+    ASTPtr create_query;
+    {
+        std::lock_guard lock{mutex};
+        auto it = create_queries.find(table_name);
+        if (it == create_queries.end() || !it->second)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot rename: There is no metadata of table {}", backQuote(table_name));
+        create_query = it->second->clone();
+        detachTableUnlocked(table_name);
+        /// Renamed, not detached: the name is free.
+        snapshot_detached_tables.erase(table_name);
+        create_queries.erase(it);
+    }
+    auto & create = create_query->as<ASTCreateQuery &>();
+    create.setDatabase(new_id.database_name);
+    create.setTable(new_id.table_name);
+    return create_query;
 }
 
 ASTPtr DatabaseMemory::getCreateDatabaseQueryImpl() const

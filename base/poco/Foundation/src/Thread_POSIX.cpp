@@ -29,6 +29,19 @@
 #endif
 
 //
+// Without threads, the libc of Emscripten has no scheduling at all. There is never a thread whose priority
+// to set either: `pthread_create` always fails.
+//
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+#	define POCO_THREAD_PRIORITY_MIN 0
+#	define POCO_THREAD_PRIORITY_MAX 0
+extern "C" int pthread_setschedparam(pthread_t, int, const struct sched_param *)
+{
+	return ENOTSUP;
+}
+#endif
+
+//
 // Block SIGPIPE in main thread.
 //
 #if defined(POCO_OS_FAMILY_UNIX) && !defined(POCO_VXWORKS)

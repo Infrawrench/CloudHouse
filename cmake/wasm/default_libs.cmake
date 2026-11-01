@@ -7,9 +7,13 @@
 # avoid. So this file only recreates the one CMake target the rest of the tree expects.
 #
 # The `-pthread` and `-sMEMORY64` flags are ABI flags and are applied to every target in
-# `cmake/target.cmake`, which runs before this file.
+# `cmake/target.cmake`, which runs before this file (except `-pthread` with `WASM_ISOLATE`).
 
 add_library (Threads::Threads INTERFACE IMPORTED)
-set_target_properties (Threads::Threads PROPERTIES INTERFACE_COMPILE_OPTIONS "-pthread")
+# The single-threaded isolate build has no threads at all, and `-pthread` on any target would make its objects
+# require shared memory.
+if (NOT WASM_ISOLATE)
+    set_target_properties (Threads::Threads PROPERTIES INTERFACE_COMPILE_OPTIONS "-pthread")
+endif ()
 
 message (STATUS "Default libraries: provided by the Emscripten sysroot")

@@ -57,10 +57,20 @@ if (OS_WASM)
     add_compile_options (-fwasm-exceptions)
     add_link_options (-fwasm-exceptions)
 
-    # Emscripten implements pthreads on Web Workers plus SharedArrayBuffer, which needs the page
-    # to be cross-origin isolated. Also an ABI flag, so compile and link both.
-    add_compile_options (-pthread)
-    add_link_options (-pthread)
+    # A build for single-threaded isolates, such as Cloudflare Workers, which have no Web Workers
+    # and no `SharedArrayBuffer`. Thread pools run their jobs inline and background pools spawn
+    # nothing (`OS_WASM_ISOLATE` in the sources). Its only executable is `clickhouse-isolate`,
+    # see `programs/isolate`.
+    option (WASM_ISOLATE "Build for single-threaded WebAssembly isolates" OFF)
+
+    if (WASM_ISOLATE)
+        add_definitions (-D OS_WASM_ISOLATE)
+    else ()
+        # Emscripten implements pthreads on Web Workers plus SharedArrayBuffer, which needs the page
+        # to be cross-origin isolated. Also an ABI flag, so compile and link both.
+        add_compile_options (-pthread)
+        add_link_options (-pthread)
+    endif ()
 
     # Nothing here can work in a WebAssembly sandbox: there are no raw sockets, no subprocesses,
     # no `dlopen`, no JIT and no architecture-specific code paths.
@@ -68,12 +78,16 @@ if (OS_WASM)
     set (ENABLE_GRPC OFF CACHE INTERNAL "")
     # Protobuf needs a `protoc` that runs on the host, and the nested native configure at the
     # bottom of the top-level `CMakeLists.txt` would be handed `emcc` as its host compiler.
-    # Arrow, Parquet and ORC hard-depend on it, so they go with it.
+    # ORC hard-depends on it. Arrow and Parquet only need a `flatc` that runs on the host, which
+    # `HOST_FLATC` can name (see `contrib/flatbuffers-cmake`).
     set (ENABLE_PROTOBUF OFF CACHE INTERNAL "")
+    set (ENABLE_ORC OFF CACHE INTERNAL "")
     # Its `kj` library uses `fallocate` and friends unconditionally in its POSIX branch,
     # which the Emscripten libc does not provide.
     set (ENABLE_CAPNP OFF CACHE INTERNAL "")
-    set (ENABLE_PARQUET OFF CACHE INTERNAL "")
+    if (NOT HOST_FLATC)
+        set (ENABLE_PARQUET OFF CACHE INTERNAL "")
+    endif ()
     set (ENABLE_ARROW_FLIGHT OFF CACHE INTERNAL "")
     set (ENABLE_HDFS OFF CACHE INTERNAL "")
     set (ENABLE_MYSQL OFF CACHE INTERNAL "")
@@ -128,25 +142,29 @@ if (OS_WASM)
     # the memory size that a grow on another thread updates later, so they can trap in just-grown memory
     # (https://issues.chromium.org/issues/529880019). It may still grow (the maximum has to be explicit
     # when growth is combined with shared memory).
-    add_link_options (-sSTACK_SIZE=8388608)
-    add_link_options (-sINITIAL_MEMORY=2147483648)
-    add_link_options (-sALLOW_MEMORY_GROWTH=1)
-    add_link_options (-sMAXIMUM_MEMORY=17179869184)
     # No DWARF in the linked module: binaryen's `wasm-opt` asserts in its debug-info
     # bookkeeping (`AddrExprMap::add`) on a module with this much DWARF, and gigabytes
     # of debug info are of no use to a WebAssembly engine anyway. `-g0` comes after the
     # `-g` from RelWithDebInfo on the link line, and the last one wins; `emcc` then has
     # `wasm-ld` strip the debug sections of the inputs.
     add_link_options (-g0)
-    # This code blocks its calling thread freely (thread pools, condition variables). In a
-    # browser the main thread must keep running the event loop, or the Web Workers that back
-    # new pthreads can never be spawned and the first blocking `pthread_create` deadlocks the
-    # page. Run `main` on a pthread of its own and leave the browser thread to the event loop.
-    add_link_options (-sPROXY_TO_PTHREAD=1)
-    # These are command-line programs: when `main` returns, tear the runtime down - including
-    # the Workers backing the remaining background threads, which would otherwise keep the
-    # process (or the page) alive indefinitely.
-    add_link_options (-sEXIT_RUNTIME=1)
+    if (WASM_ISOLATE)
+        # The memory settings of the isolate build are in `programs/isolate/CMakeLists.txt`.
+    else ()
+        add_link_options (-sSTACK_SIZE=8388608)
+        add_link_options (-sINITIAL_MEMORY=2147483648)
+        add_link_options (-sALLOW_MEMORY_GROWTH=1)
+        add_link_options (-sMAXIMUM_MEMORY=17179869184)
+        # This code blocks its calling thread freely (thread pools, condition variables). In a
+        # browser the main thread must keep running the event loop, or the Web Workers that back
+        # new pthreads can never be spawned and the first blocking `pthread_create` deadlocks the
+        # page. Run `main` on a pthread of its own and leave the browser thread to the event loop.
+        add_link_options (-sPROXY_TO_PTHREAD=1)
+        # These are command-line programs: when `main` returns, tear the runtime down - including
+        # the Workers backing the remaining background threads, which would otherwise keep the
+        # process (or the page) alive indefinitely.
+        add_link_options (-sEXIT_RUNTIME=1)
+    endif ()
 endif ()
 
 # Since we always use toolchain files to generate hermetic builds, cmake will

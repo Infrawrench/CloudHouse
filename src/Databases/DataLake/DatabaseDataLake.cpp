@@ -137,10 +137,12 @@ namespace ServerSetting
     extern const ServerSettingsBool s3_load_table_anonymously_if_credentials_restricted;
 }
 
+#if USE_AWS_S3
 namespace S3RequestSetting
 {
     extern const S3RequestSettingsBool use_idempotency_id;
 }
+#endif
 
 namespace ErrorCodes
 {
@@ -472,12 +474,12 @@ void DatabaseDataLake::initialize() const
                 catalog_parameters,
                 Context::getGlobalContextInstance(),
                 allow_server_credentials_in_user_queries);
+            break;
 #else
             throw Exception(
                 ErrorCodes::SUPPORT_IS_DISABLED,
                 "Amazon S3 Tables catalog requires ClickHouse built with USE_AWS_S3 and USE_SSL");
 #endif
-            break;
         }
     }
 }
