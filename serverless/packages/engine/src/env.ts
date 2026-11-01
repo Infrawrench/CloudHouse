@@ -12,6 +12,9 @@ export interface Env extends Tokens {
 	ENGINE_HOST: DurableObjectNamespace<EngineHost>;
 	/// How many `EngineHost` objects the queries are spread over. With 0, they run in the isolate of the request.
 	ENGINE_POOL?: string;
+	/// How often the engines of the pool and the shards wake up to stay running, see `EngineHost`. Without it, they
+	/// do not.
+	KEEP_WARM_SECONDS?: string;
 	/// The parts of the tables, as `parts/<name>`.
 	PARTS: R2Bucket;
 	/// The merges to run in the background, see `MergeMessage`.

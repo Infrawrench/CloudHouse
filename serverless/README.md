@@ -258,7 +258,9 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
 - **Starting.** An engine that has had no query for a minute or two is evicted, and the one that the next query
   starts compiles the code that the query runs and attaches the tables, about a second. An engine that starts tells
   the shards to start too (`EngineHost.warm`), so that they are running by the time it fans out, rather than starting
-  one after it.
+  one after it. With `KEEP_WARM_SECONDS` (50 on `cloudhouse-instances`), an engine of the pool or a shard that has
+  been used has an alarm that often, which syncs its engine and keeps the object from being evicted, until it has
+  had no use for a day. It costs the time of 24 objects in Durable Objects, about $10 to $15 a month.
 - **Memory.** A query can use up to 72 MiB of the memory of an engine, and fails with `MEMORY_LIMIT_EXCEEDED`
   beyond that. Reads and merges stream, so this limits the state of a query (a hash table of `GROUP BY`, a sort, the
   right side of a `JOIN`), not the size of a table. A query puts each part it writes in R2 as soon as it is written,

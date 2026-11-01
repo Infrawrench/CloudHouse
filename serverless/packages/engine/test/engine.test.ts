@@ -1,4 +1,4 @@
-import { SELF, createExecutionContext, createMessageBatch, getQueueResult } from "cloudflare:test";
+import { SELF, createExecutionContext, createMessageBatch, getQueueResult, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import worker from "../src/index";
 import { Catalog } from "../src/catalog";
@@ -122,10 +122,18 @@ describe("engine", () => {
 		expect((await cache.fetch("https://parts/00000000-0000-4000-8000-000000000001_1_1_all/0/1")).status).toBe(404);
 	});
 
-	it("warms an engine before its first query", async () => {
+	it("warms an engine before its first query, and keeps it warm", async () => {
 		const host = env.ENGINE_HOST.get(env.ENGINE_HOST.idFromName("shard-0"));
 		await host.warm();
 		expect((await query("SELECT 1")).text).toBe("1\n");
+		/// The use set an alarm, which wakes the object and sets the next one.
+		expect(await runInDurableObject(host, (_, state) => state.storage.getAlarm())).not.toBeNull();
+		expect(await runDurableObjectAlarm(host)).toBe(true);
+		expect(await runInDurableObject(host, (_, state) => state.storage.getAlarm())).not.toBeNull();
+		/// A day without a use, and it stops.
+		await runInDurableObject(host, (_, state) => state.storage.put("last_use", Date.now() - 2 * 24 * 60 * 60 * 1000));
+		expect(await runDurableObjectAlarm(host)).toBe(true);
+		expect(await runInDurableObject(host, (_, state) => state.storage.getAlarm())).toBeNull();
 	});
 
 	it("merges from the queue", async () => {

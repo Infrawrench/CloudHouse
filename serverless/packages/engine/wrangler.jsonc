@@ -73,8 +73,10 @@
       "triggers": {
         "crons": ["17 * * * *"]
       },
+      // The engines keep running between the queries of a chat, see `EngineHost`.
       "vars": {
-        "ENGINE_POOL": "8"
+        "ENGINE_POOL": "8",
+        "KEEP_WARM_SECONDS": "50"
       },
       "r2_buckets": [
         { "binding": "PARTS", "bucket_name": "cloudhouse-instances-parts" }
