@@ -167,10 +167,12 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
 ```
 
 - **Parts.** As in `MergeTree`, an `INSERT` makes an immutable part per partition, sorted by `ORDER BY`. A part is
-  in R2 as `parts/<name>`, where the name is `<uuid>_<rows>_<bytes>_<partition id>`, and its format is `CHPART02`
-  (`programs/isolate/ObjectPart.h`): blocks of at most 65,536 rows in `Native`, each compressed with `ZSTD` on its
-  own, then an index with the offset and size of every block and the minimum and maximum of every column of the
-  sorting key and of the partition key.
+  in R2 as `parts/<name>`, where the name is `<uuid>_<rows>_<bytes>_<partition id>`, and its format is `CHPART03`
+  (`programs/isolate/ObjectPart.h`): its columns one after another, each as a chunk per block of at most 16,384 rows,
+  in `Native` and compressed with `ZSTD` on its own, then an index with the offset and size of every chunk and the
+  minimum and maximum of every column of the sorting key and of the partition key per block. A query reads only the
+  chunks of the columns that it needs, and the chunks close to each other in one read. Parts of the earlier format,
+  `CHPART02`, whose blocks have all their columns together, are read as before, and merges rewrite them.
 - **Reads.** The engine streams parts: it reads the index of a part, then the blocks that the filter of the query
   may need, with range reads that it waits for (JSPI: `ch_host_read_range` in `host.js`), so it holds a block of
   a part at a time rather than the part. Before reading, it tells the Worker what it is going to read, and the
@@ -205,7 +207,7 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
   adds; `MODIFY TTL`, `REMOVE TTL`, `MODIFY SETTING` and `RESET SETTING` change the definition. Columns of the keys
   and of the TTL cannot be changed.
 - **Settings.** `SETTINGS` takes the settings of `MergeTree`, which are checked as there. `index_granularity` is
-  the rows of a block of a part (65,536 without it, at most 262,144): smaller blocks make point queries read less,
+  the rows of a block of a part (16,384 without it, at most 262,144): smaller blocks make point queries read less,
   and it cannot change. The other settings are kept, for `SHOW CREATE TABLE`, and do nothing: a part is one object
   in R2, with nothing else to tune. `disk` and `storage_policy` are refused.
 - **Data skipping indexes.** `INDEX <name> <expression> TYPE minmax`, `set`, `bloom_filter`, `ngrambf_v1` and
@@ -301,6 +303,21 @@ have more shards than parts. Latencies are of the requests that did not start an
 One query gains little past 8 shards, while 16 shards serve concurrent queries best: each reads less, so the shards
 are busy for less time. The defaults, 4 MiB per shard and at most 16, give this table 16 shards; a smaller
 `SHARD_BYTES` would fan out tables of a few MiB, which an engine reads in about 100 ms itself.
+
+Formats, 2026-11-01, on `cloudhouse-instances`: the AWS price list, 7.1 million rows of 36 columns in 27 partitions
+that are buckets of a hash of `instance_type`, queries as its chat writes them, on one warm engine:
+
+| Query | `CHPART02` | `CHPART03` | `CHPART03`, `bloom_filter` on `instance_type` |
+|---|---|---|---|
+| Prices of one instance type in one region | 0.25 s | 0.36 s | 0.17 s |
+| The cheapest arm64 instance with 16 vCPUs in a region | 0.72 s | 0.72 s | 0.40 s |
+| The average price per family in a region | 0.73 s | 0.30 s | |
+| The cheapest PostgreSQL RDS instance | 0.69 s | 0.36 s | |
+| `count()` per platform | 0.49 s | 0.20 s | |
+| The cheapest GPU instances in a region | 0.83 s | 0.39 s | 0.42 s |
+
+A query that aggregates reads only its columns, 2 to 2.4 times faster. A query of one instance type reads a block of
+every partition, since the partitions are by a hash of it, unless a data skipping index on it skips the others.
 
 Tables in the `Memory` engine are scratch space: they last as long as the isolate does, and only it sees them.
 

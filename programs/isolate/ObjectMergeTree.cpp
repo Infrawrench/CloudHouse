@@ -416,10 +416,16 @@ public:
             if (!blocks.empty())
                 chosen.emplace_back(part, std::move(index), std::move(blocks));
         }
+        /// The columns that the parts have, which the source reads, without the virtual ones.
+        Names physical;
+        for (const auto & column : columns)
+            if (column.name != "_part" && column.name != "_partition_id"
+                && std::find(physical.begin(), physical.end(), column.getNameInStorage()) == physical.end())
+                physical.push_back(column.getNameInStorage());
         Pipes pipes;
         for (auto & [part, index, blocks] : chosen)
         {
-            prefetchPartBlocks(part, *index, blocks);
+            prefetchPartBlocks(part, *index, blocks, physical);
             pipes.emplace_back(std::make_shared<ObjectPartSource>(output_header, part, index, std::move(blocks), columns, metadata->getColumns(), context));
         }
         if (pipes.empty())
@@ -949,17 +955,28 @@ public:
     }
 
 private:
-    /// The bytes of the blocks of the visible parts that the filter of the query may need.
+    /// The bytes that the query reads: of the columns that it needs, of the blocks of the visible parts that its filter
+    /// may need.
     UInt64 selectedBytes(const SelectQueryInfo & query_info, const ContextPtr & context) const
     {
         const auto metadata = getInMemoryMetadataPtr(context, false);
         const auto parts = ObjectPartStore::instance().getVisibleParts(getStorageID());
         const auto minmax = tableMinmaxColumns(*metadata);
+        Names needed;
+        for (const auto & name : query_info.planner_context->getTableExpressionDataOrThrow(query_info.table_expression).getColumnNames())
+            if (auto column = metadata->getColumns().tryGetColumnOrSubcolumn(GetColumnsOptions::All, name))
+                needed.push_back(column->getNameInStorage());
         UInt64 bytes = 0;
         if (!query_info.filter_actions_dag)
         {
             for (const auto & part : parts)
-                bytes += ObjectPartName::parse(part).bytes;
+                prefetchPartIndex(part, ObjectPartName::parse(part).bytes);
+            for (const auto & part : parts)
+            {
+                const auto index = readPartIndex(part, ObjectPartName::parse(part).bytes);
+                for (size_t i = 0; i < index->blocks.size(); ++i)
+                    bytes += index->bytesToRead(i, needed);
+            }
             return bytes;
         }
         ActionsDAGWithInversionPushDown inverted(query_info.filter_actions_dag->getOutputs().front(), context, /* boolean_context= */ true);
@@ -973,7 +990,7 @@ private:
             const auto index = readPartIndex(part, ObjectPartName::parse(part).bytes);
             for (size_t i = 0; i < index->blocks.size(); ++i)
                 if (mayContainRows(condition, minmax, *index, index->blocks[i].ranges) && skipIndicesMayContainRows(skip, *index, i))
-                    bytes += index->blocks[i].size;
+                    bytes += index->bytesToRead(i, needed);
         }
         return bytes;
     }
@@ -985,7 +1002,7 @@ private:
         std::vector<size_t> blocks(index->blocks.size());
         for (size_t i = 0; i < blocks.size(); ++i)
             blocks[i] = i;
-        prefetchPartBlocks(part, *index, blocks);
+        prefetchPartBlocks(part, *index, blocks, {});
         return Pipe(std::make_shared<ObjectPartSource>(
             std::make_shared<const Block>(metadata->getSampleBlock()), part, std::move(index), std::move(blocks),
             metadata->getColumns().getAllPhysical(), metadata->getColumns(), context));

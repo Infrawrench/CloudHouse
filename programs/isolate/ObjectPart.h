@@ -19,16 +19,23 @@ class KeyCondition;
 
 /// A part of `ObjectMergeTree`, as it is in object storage:
 ///
-///     "CHPART02" UInt64 revision
-///     the blocks: each in the `Native` format of `revision`, compressed on its own, at most `rows_per_block` rows
-///     the index: one `Native` block, not compressed, with a row per block: `_offset`, `_size` and `_rows`, then the
+///     "CHPART03" UInt64 revision
+///     the columns, one after the other: of each, its chunk of each block, in the `Native` format of `revision`,
+///         compressed on its own; a block has at most `rows_per_block` rows
+///     the index: one `Native` block, not compressed, with a row per block: `_rows`, the offset and the size of the
+///         chunk of each column, `_col_offset.<column>` and `_col_size.<column>`, then the
 ///         minimum and the maximum of each column of the min-max index, `_min.<column>` and `_max.<column>`, then the
 ///         granule of each data skipping index of the table, `_skip.<index>`, and the value of the partition of the
 ///         part, as `system.parts` shows it, `_partition`
-///     UInt64 offset of the index, UInt64 size of the index, "CHPART02"
+///     UInt64 offset of the index, UInt64 size of the index, "CHPART03"
 ///
-/// A query reads the index, then the blocks that its filter may need, with range reads: the engine asks the host for
-/// the bytes and waits for them (JSPI, see `host.js`), so that it holds one block of a part at a time, not the part.
+/// A query reads the index, then the chunks of the columns that it needs of the blocks that its filter may need, with
+/// range reads: the engine asks the host for the bytes and waits for them (JSPI, see `host.js`), so that it holds one
+/// block of a part at a time, not the part. The chunks of a column are together, so reading a column of many blocks
+/// is one range.
+///
+/// A part of the earlier format, "CHPART02", has the blocks with all their columns compressed together, and `_offset`
+/// and `_size` of each block in its index; it is read whole.
 ///
 /// The min-max index covers the columns of the sorting key and of the partition key that can be compared: a part
 /// and a block are skipped when their ranges of these columns cannot satisfy the filter (`KeyCondition`). A data
@@ -55,13 +62,20 @@ struct ObjectPartIndex
 {
     struct Entry
     {
+        /// Of the block, in a part of "CHPART02"; `size` is the size of all the chunks of the block in "CHPART03".
         UInt64 offset = 0;
         UInt64 size = 0;
         UInt64 rows = 0;
         Hyperrectangle ranges;
+        /// The offset and the size of the chunk of each of `columns`, in a part of "CHPART03".
+        std::vector<std::pair<UInt64, UInt64>> chunks;
     };
 
+    /// 2 or 3, of "CHPART02" or "CHPART03".
+    UInt8 format = 3;
     UInt64 revision = 0;
+    /// The columns of the part, in a part of "CHPART03".
+    Names columns;
     /// The columns of the min-max index, as they were when the part was written.
     NamesAndTypesList minmax_columns;
     std::vector<Entry> blocks;
@@ -71,6 +85,8 @@ struct ObjectPartIndex
     String partition;
 
     UInt64 rows() const;
+    /// The bytes that reading `names` of block `block` reads: of their chunks, or of the whole block.
+    UInt64 bytesToRead(size_t block, const Names & names) const;
 };
 
 using ObjectPartIndexPtr = std::shared_ptr<const ObjectPartIndex>;
@@ -79,8 +95,9 @@ using ObjectPartIndexPtr = std::shared_ptr<const ObjectPartIndex>;
 class ObjectPartWriter
 {
 public:
-    /// The rows of a block, unless the table sets `index_granularity`.
-    static constexpr size_t default_rows_per_block = 65536;
+    /// The rows of a block, unless the table sets `index_granularity`. A merge holds a block of every column of every
+    /// part that it merges, so a block of a wide table has to be small.
+    static constexpr size_t default_rows_per_block = 16384;
 
     ObjectPartWriter(const Block & header, NamesAndTypesList minmax_columns, ObjectPartSkipIndices skip_indices, size_t rows_per_block);
     ~ObjectPartWriter();
@@ -108,6 +125,9 @@ String readPartRange(const String & part, UInt64 offset, UInt64 size);
 /// Gives a part that a query wrote to the host, which puts it in object storage before it returns.
 void writePart(const String & part, const String & data);
 
+/// The message of the error of the last import of the host that failed, which it returned -1 for.
+String takeHostError();
+
 /// The index of a part of `bytes` bytes, read from the host, or from a cache of the indexes that the isolate read.
 ObjectPartIndexPtr readPartIndex(const String & part, UInt64 bytes);
 ObjectPartIndexPtr cachedPartIndex(const String & part);
@@ -116,7 +136,7 @@ ObjectPartIndexPtr cachedPartIndex(const String & part);
 /// and the chosen blocks, a run of consecutive ones in one range.
 void prefetchPartRange(const String & part, UInt64 offset, UInt64 size);
 void prefetchPartIndex(const String & part, UInt64 bytes);
-void prefetchPartBlocks(const String & part, const ObjectPartIndex & index, const std::vector<size_t> & blocks);
+void prefetchPartBlocks(const String & part, const ObjectPartIndex & index, const std::vector<size_t> & blocks, const Names & columns);
 
 /// Reads a block of a part and converts it to the columns of the table now: the part may predate an `ALTER`, so a
 /// column that it lacks gets its default, and a column of another type is cast.

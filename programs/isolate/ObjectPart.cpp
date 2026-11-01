@@ -37,7 +37,10 @@
 /// host has read them.
 extern "C" size_t ch_host_read_range(const char * part, size_t part_size, size_t offset, size_t size, char * dest);
 /// Imported from the host: puts a part that the engine wrote in object storage, and returns once it is there.
-extern "C" void ch_host_write_part(const char * part, size_t part_size, const char * data, size_t size);
+extern "C" int ch_host_write_part(const char * part, size_t part_size, const char * data, size_t size);
+/// Imported from the host: the message of the error of its last import that returned -1.
+extern "C" size_t ch_host_error_size();
+extern "C" void ch_host_take_error(char * dest, size_t size);
 /// Imported from the host: the engine is going to read the bytes `[offset, offset + size)` of a part, so the host can
 /// start reading them, and read several ranges at once. It does not wait.
 extern "C" void ch_host_prefetch(const char * part, size_t part_size, size_t offset, size_t size);
@@ -50,17 +53,20 @@ namespace ErrorCodes
     extern const int CANNOT_PARSE_INPUT_ASSERTION_FAILED;
     extern const int CANNOT_READ_ALL_DATA;
     extern const int NOT_IMPLEMENTED;
+    extern const int RECEIVED_ERROR_FROM_REMOTE_IO_SERVER;
 }
 
 namespace
 {
 
-constexpr std::string_view magic = "CHPART02";
+constexpr std::string_view magic = "CHPART03";
+constexpr std::string_view magic_v2 = "CHPART02";
 constexpr UInt64 revision = DBMS_TCP_PROTOCOL_VERSION;
 /// The footer: the offset and the size of the index, the revision, and the magic.
 constexpr size_t footer_size = 3 * sizeof(UInt64) + magic.size();
-/// The end of a part that is read at once, which holds the footer and, mostly, the index.
-constexpr size_t tail_size = 64 * 1024;
+/// The end of a part that is read at once, which holds the footer and, mostly, the index: a few KiB, unless the part
+/// has many blocks or a data skipping index with large granules, which take a second read.
+constexpr size_t tail_size = 16 * 1024;
 /// How many indexes the isolate keeps: they are small, and a part never changes.
 constexpr size_t index_cache_size = 4096;
 
@@ -68,21 +74,36 @@ const String min_prefix = "_min.";
 const String max_prefix = "_max.";
 const String skip_prefix = "_skip.";
 const String partition_column = "_partition";
+const String offset_prefix = "_col_offset.";
+const String size_prefix = "_col_size.";
 
-ObjectPartIndexPtr parseIndex(std::string_view data, UInt64 index_revision)
+ObjectPartIndexPtr parseIndex(std::string_view data, UInt64 index_revision, UInt8 format)
 {
     ReadBufferFromMemory in(data.data(), data.size());
     NativeReader reader(in, index_revision);
     Block block = reader.read();
 
     auto index = std::make_shared<ObjectPartIndex>();
+    index->format = format;
     index->revision = index_revision;
+    std::vector<ColumnPtr> chunk_offsets;
+    std::vector<ColumnPtr> chunk_sizes;
     for (const auto & column : block)
+    {
         if (column.name.starts_with(min_prefix))
             index->minmax_columns.emplace_back(column.name.substr(min_prefix.size()), column.type);
+        if (column.name.starts_with(offset_prefix))
+        {
+            const String name = column.name.substr(offset_prefix.size());
+            index->columns.push_back(name);
+            chunk_offsets.push_back(column.column);
+            chunk_sizes.push_back(block.getByName(size_prefix + name).column);
+        }
+    }
 
-    const auto & offsets = block.getByName("_offset").column;
-    const auto & sizes = block.getByName("_size").column;
+    const ColumnPtr empty = ColumnUInt64::create(block.rows(), 0);
+    const auto & offsets = format == 2 ? block.getByName("_offset").column : empty;
+    const auto & sizes = format == 2 ? block.getByName("_size").column : empty;
     const auto & rows = block.getByName("_rows").column;
     std::vector<ColumnPtr> mins;
     std::vector<ColumnPtr> maxs;
@@ -93,9 +114,14 @@ ObjectPartIndexPtr parseIndex(std::string_view data, UInt64 index_revision)
     }
     for (size_t i = 0; i < block.rows(); ++i)
     {
-        ObjectPartIndex::Entry entry{.offset = offsets->getUInt(i), .size = sizes->getUInt(i), .rows = rows->getUInt(i), .ranges = {}};
+        ObjectPartIndex::Entry entry{.offset = offsets->getUInt(i), .size = sizes->getUInt(i), .rows = rows->getUInt(i), .ranges = {}, .chunks = {}};
         for (size_t c = 0; c < mins.size(); ++c)
             entry.ranges.emplace_back((*mins[c])[i], true, (*maxs[c])[i], true);
+        for (size_t c = 0; c < chunk_offsets.size(); ++c)
+        {
+            entry.chunks.emplace_back(chunk_offsets[c]->getUInt(i), chunk_sizes[c]->getUInt(i));
+            entry.size += chunk_sizes[c]->getUInt(i);
+        }
         index->blocks.push_back(std::move(entry));
     }
     if (block.has(partition_column) && block.rows() > 0)
@@ -133,6 +159,18 @@ UInt64 ObjectPartIndex::rows() const
     return result;
 }
 
+UInt64 ObjectPartIndex::bytesToRead(size_t block, const Names & names) const
+{
+    const auto & entry = blocks.at(block);
+    if (format == 2)
+        return entry.size;
+    UInt64 result = 0;
+    for (size_t c = 0; c < columns.size(); ++c)
+        if (std::find(names.begin(), names.end(), columns[c]) != names.end())
+            result += entry.chunks[c].second;
+    return result;
+}
+
 
 ObjectPartSkipIndices skipIndices(const StorageMetadataPtr & metadata, const MergeTreeSettings & settings)
 {
@@ -160,14 +198,28 @@ ObjectPartSkipIndices skipIndices(const StorageMetadataPtr & metadata, const Mer
 
 struct ObjectPartWriter::State
 {
-    String data;
-    WriteBufferFromString out{data};
-    CompressedWriteBuffer compressed{out, CompressionCodecFactory::instance().get("ZSTD", 1)};
+    /// The chunks of one column, which are together in the part.
+    struct ColumnStream
+    {
+        String data;
+        WriteBufferFromString out{data};
+        /// A table may have dozens of columns, so the buffer of each is small.
+        CompressedWriteBuffer compressed{out, CompressionCodecFactory::instance().get("ZSTD", 1), 64 * 1024};
+        NativeWriter writer;
+        MutableColumnPtr offsets = ColumnUInt64::create();
+        MutableColumnPtr sizes = ColumnUInt64::create();
+
+        explicit ColumnStream(const ColumnWithTypeAndName & column)
+            : writer(compressed, revision, std::make_shared<const Block>(Block{column.cloneEmpty()}))
+        {
+        }
+    };
+
     Block header;
-    NativeWriter writer;
+    std::vector<std::unique_ptr<ColumnStream>> streams;
     NamesAndTypesList minmax_columns;
     ObjectPartSkipIndices skip_indices;
-    MutableColumns offsets_sizes_rows;
+    MutableColumnPtr rows = ColumnUInt64::create();
     MutableColumns mins;
     MutableColumns maxs;
     MutableColumns skip_granules;
@@ -175,14 +227,11 @@ struct ObjectPartWriter::State
 
     State(const Block & header_, NamesAndTypesList minmax_columns_, ObjectPartSkipIndices skip_indices_)
         : header(header_.cloneEmpty())
-        , writer(compressed, revision, std::make_shared<const Block>(header))
         , minmax_columns(std::move(minmax_columns_))
         , skip_indices(std::move(skip_indices_))
     {
-        out.write(magic.data(), magic.size());
-        writeBinaryLittleEndian(revision, out);
-        for (size_t i = 0; i < 3; ++i)
-            offsets_sizes_rows.push_back(ColumnUInt64::create());
+        for (const auto & column : header)
+            streams.push_back(std::make_unique<ColumnStream>(column));
         for (const auto & column : minmax_columns)
         {
             mins.push_back(column.type->createColumn());
@@ -231,15 +280,17 @@ void ObjectPartWriter::writeBlock(const Block & block)
     if (block.rows() == 0)
         return;
     auto & s = *state;
-    /// Each block is compressed on its own, so that it can be read without the ones before it.
-    const UInt64 offset = s.out.count();
-    s.writer.write(block);
-    s.writer.flush();
-    const UInt64 size = s.out.count() - offset;
-
-    s.offsets_sizes_rows[0]->insert(offset);
-    s.offsets_sizes_rows[1]->insert(size);
-    s.offsets_sizes_rows[2]->insert(static_cast<UInt64>(block.rows()));
+    /// The chunk of each column is compressed on its own, so that it can be read without the others.
+    for (size_t c = 0; c < s.streams.size(); ++c)
+    {
+        auto & stream = *s.streams[c];
+        const UInt64 offset = stream.out.count();
+        stream.writer.write(Block{block.getByName(s.header.getByPosition(c).name)});
+        stream.writer.flush();
+        stream.offsets->insert(offset);
+        stream.sizes->insert(stream.out.count() - offset);
+    }
+    s.rows->insert(static_cast<UInt64>(block.rows()));
     size_t i = 0;
     for (const auto & column : s.minmax_columns)
     {
@@ -272,13 +323,30 @@ void ObjectPartWriter::writeBlock(const Block & block)
 String ObjectPartWriter::finish()
 {
     auto & s = *state;
-    s.compressed.finalize();
+    String data;
+    WriteBufferFromString out(data);
+    out.write(magic.data(), magic.size());
+    writeBinaryLittleEndian(revision, out);
 
     Block index;
     auto uint64 = std::make_shared<DataTypeUInt64>();
-    index.insert({std::move(s.offsets_sizes_rows[0]), uint64, "_offset"});
-    index.insert({std::move(s.offsets_sizes_rows[1]), uint64, "_size"});
-    index.insert({std::move(s.offsets_sizes_rows[2]), uint64, "_rows"});
+    index.insert({std::move(s.rows), uint64, "_rows"});
+    for (size_t c = 0; c < s.streams.size(); ++c)
+    {
+        auto & stream = *s.streams[c];
+        stream.compressed.finalize();
+        stream.out.finalize();
+        /// The offsets were within the column: they become offsets in the part.
+        const UInt64 base = out.count();
+        out.write(stream.data.data(), stream.data.size());
+        auto offsets = ColumnUInt64::create();
+        for (size_t i = 0; i < stream.offsets->size(); ++i)
+            offsets->insert(base + stream.offsets->getUInt(i));
+        const String & name = s.header.getByPosition(c).name;
+        index.insert({std::move(offsets), uint64, offset_prefix + name});
+        index.insert({std::move(stream.sizes), uint64, size_prefix + name});
+        stream.data = {};
+    }
     size_t i = 0;
     for (const auto & column : s.minmax_columns)
     {
@@ -291,24 +359,34 @@ String ObjectPartWriter::finish()
     const auto string = std::make_shared<DataTypeString>();
     index.insert({string->createColumnConst(index.rows(), s.partition)->convertToFullColumnIfConst(), string, partition_column});
 
-    const UInt64 index_offset = s.out.count();
-    NativeWriter index_writer(s.out, revision, std::make_shared<const Block>(index.cloneEmpty()));
+    const UInt64 index_offset = out.count();
+    NativeWriter index_writer(out, revision, std::make_shared<const Block>(index.cloneEmpty()));
     index_writer.write(index);
     index_writer.flush();
-    const UInt64 index_size = s.out.count() - index_offset;
-    writeBinaryLittleEndian(index_offset, s.out);
-    writeBinaryLittleEndian(index_size, s.out);
-    writeBinaryLittleEndian(revision, s.out);
-    s.out.write(magic.data(), magic.size());
-    s.out.finalize();
-    return std::move(s.data);
+    const UInt64 index_size = out.count() - index_offset;
+    writeBinaryLittleEndian(index_offset, out);
+    writeBinaryLittleEndian(index_size, out);
+    writeBinaryLittleEndian(revision, out);
+    out.write(magic.data(), magic.size());
+    out.finalize();
+    return data;
 }
 
+
+String takeHostError()
+{
+    String message(ch_host_error_size(), '\0');
+    ch_host_take_error(message.data(), message.size());
+    return message;
+}
 
 String readPartRange(const String & part, UInt64 offset, UInt64 size)
 {
     String data(size, '\0');
     const size_t read = ch_host_read_range(part.data(), part.size(), offset, size, data.data());
+    /// A part that a merge has replaced since the query saw it may be gone: the host syncs and runs the query again.
+    if (read == static_cast<size_t>(-1))
+        throw Exception(ErrorCodes::RECEIVED_ERROR_FROM_REMOTE_IO_SERVER, "Cannot read part {}: {}", part, takeHostError());
     if (read != size)
         throw Exception(ErrorCodes::CANNOT_READ_ALL_DATA, "Read {} bytes of part {} at {} instead of {}", read, part, offset, size);
     return data;
@@ -316,7 +394,8 @@ String readPartRange(const String & part, UInt64 offset, UInt64 size)
 
 void writePart(const String & part, const String & data)
 {
-    ch_host_write_part(part.data(), part.size(), data.data(), data.size());
+    if (ch_host_write_part(part.data(), part.size(), data.data(), data.size()) != 0)
+        throw Exception(ErrorCodes::RECEIVED_ERROR_FROM_REMOTE_IO_SERVER, "Cannot write part {}: {}", part, takeHostError());
 }
 
 void prefetchPartRange(const String & part, UInt64 offset, UInt64 size)
@@ -330,11 +409,56 @@ void prefetchPartIndex(const String & part, UInt64 bytes)
         prefetchPartRange(part, bytes - std::min<UInt64>(bytes, tail_size), std::min<UInt64>(bytes, tail_size));
 }
 
-void prefetchPartBlocks(const String & part, const ObjectPartIndex & index, const std::vector<size_t> & blocks)
+void prefetchPartBlocks(const String & part, const ObjectPartIndex & index, const std::vector<size_t> & blocks, const Names & columns)
 {
     /// The runs of consecutive blocks, each in one read of at most `max_prefetch_bytes`, which the host holds until the
     /// engine has read all of it: it shares the memory of the isolate with the engine.
     constexpr UInt64 max_prefetch_bytes = 2 * 1024 * 1024;
+    if (index.format == 3)
+    {
+        /// The runs of the chunks of each column, in the order that the engine reads them: block by block.
+        std::vector<size_t> wanted;
+        for (size_t c = 0; c < index.columns.size(); ++c)
+            if (columns.empty() || std::find(columns.begin(), columns.end(), index.columns[c]) != columns.end())
+                wanted.push_back(c);
+        for (size_t i = 0; i < blocks.size();)
+        {
+            /// The blocks of this run: consecutive, and of at most `max_prefetch_bytes` in all the columns.
+            size_t j = i + 1;
+            UInt64 bytes = index.bytesToRead(blocks[i], columns.empty() ? index.columns : columns);
+            while (j < blocks.size() && blocks[j] == blocks[j - 1] + 1)
+            {
+                const UInt64 more = index.bytesToRead(blocks[j], columns.empty() ? index.columns : columns);
+                if (bytes + more > max_prefetch_bytes)
+                    break;
+                bytes += more;
+                ++j;
+            }
+            /// The range of each column, and ranges close to each other in one read, with what is between them: a read
+            /// costs more than a few KiB.
+            std::vector<std::pair<UInt64, UInt64>> ranges;
+            for (const size_t c : wanted)
+            {
+                const auto & first = index.blocks[blocks[i]].chunks[c];
+                const auto & last = index.blocks[blocks[j - 1]].chunks[c];
+                ranges.emplace_back(first.first, last.first + last.second);
+            }
+            std::sort(ranges.begin(), ranges.end());
+            constexpr UInt64 max_gap = 256 * 1024;
+            for (size_t r = 0; r < ranges.size();)
+            {
+                UInt64 begin = ranges[r].first;
+                UInt64 end = ranges[r].second;
+                size_t next = r + 1;
+                while (next < ranges.size() && ranges[next].first <= end + max_gap && ranges[next].second - begin <= max_prefetch_bytes)
+                    end = std::max(end, ranges[next++].second);
+                prefetchPartRange(part, begin, end - begin);
+                r = next;
+            }
+            i = j;
+        }
+        return;
+    }
     for (size_t i = 0; i < blocks.size();)
     {
         size_t j = i + 1;
@@ -386,14 +510,15 @@ ObjectPartIndexPtr readPartIndex(const String & part, UInt64 bytes)
     readBinaryLittleEndian(index_revision, footer);
     String part_magic(magic.size(), '\0');
     footer.readStrict(part_magic.data(), part_magic.size());
-    if (part_magic != magic || index_offset + index_size + footer_size != bytes)
+    if ((part_magic != magic && part_magic != magic_v2) || index_offset + index_size + footer_size != bytes)
         throw Exception(ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED, "Part {} is not a part of ObjectMergeTree of the format {}", part, magic);
+    const UInt8 format = part_magic == magic ? 3 : 2;
 
     ObjectPartIndexPtr index;
     if (index_offset >= tail_offset)
-        index = parseIndex(std::string_view(tail).substr(index_offset - tail_offset, index_size), index_revision);
+        index = parseIndex(std::string_view(tail).substr(index_offset - tail_offset, index_size), index_revision, format);
     else
-        index = parseIndex(readPartRange(part, index_offset, index_size), index_revision);
+        index = parseIndex(readPartRange(part, index_offset, index_size), index_revision, format);
 
     if (cache.size() >= index_cache_size)
     {
@@ -414,11 +539,36 @@ Block readPartBlock(
     const ContextPtr & context)
 {
     const auto & entry = index.blocks.at(block_index);
-    const String data = readPartRange(part, entry.offset, entry.size);
-    ReadBufferFromMemory in(data.data(), data.size());
-    CompressedReadBuffer compressed(in);
-    NativeReader reader(compressed, index.revision);
-    Block block = reader.read();
+    /// The columns of the block that are asked for, or, if one was added since the part was written, all of them, as
+    /// its default may refer to any.
+    auto read = [&](bool all)
+    {
+        if (index.format == 2)
+        {
+            const String data = readPartRange(part, entry.offset, entry.size);
+            ReadBufferFromMemory in(data.data(), data.size());
+            CompressedReadBuffer compressed(in);
+            NativeReader reader(compressed, index.revision);
+            return reader.read();
+        }
+        Block result;
+        for (size_t c = 0; c < index.columns.size(); ++c)
+        {
+            if (!all && !columns.contains(index.columns[c]))
+                continue;
+            const String data = readPartRange(part, entry.chunks[c].first, entry.chunks[c].second);
+            ReadBufferFromMemory in(data.data(), data.size());
+            CompressedReadBuffer compressed(in);
+            NativeReader reader(compressed, index.revision);
+            result.insert(reader.read().getByPosition(0));
+        }
+        return result;
+    };
+    bool has_all = true;
+    if (index.format == 3)
+        for (const auto & column : columns)
+            has_all &= std::find(index.columns.begin(), index.columns.end(), column.name) != index.columns.end();
+    Block block = read(!has_all);
 
     /// The part was written with the columns of its time: cast the ones whose type has changed since, and leave out
     /// the ones that are not there any more.

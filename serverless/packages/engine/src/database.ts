@@ -12,6 +12,9 @@ const MAX_LOAD_ROUNDS = 16;
 const READONLY = 164;
 /// `ABORTED`: a query whose data streamed has to be sent again.
 const ABORTED = 236;
+/// `RECEIVED_ERROR_FROM_REMOTE_IO_SERVER`: the engine could not read or write a part, which happens when a part that
+/// the query saw has been merged away since: the engine syncs and runs the query again.
+const PART_IO_FAILED = 86;
 
 /// The sizes that decide when a table fans out and which parts merge, in bytes of parts (compressed).
 export interface Limits {
@@ -91,6 +94,9 @@ export class Database {
 	private state: Snapshot = { version: -1, databases: new Set(), tables: new Map() };
 	/// The work runs one piece at a time: the engine is shared by the requests of the isolate.
 	private queue: Promise<unknown> = Promise.resolve();
+	/// Why the last query ran again, if it was for an error of the engine, which a query that runs again too many
+	/// times returns.
+	private retry_reason: QueryResult | undefined;
 
 	constructor(
 		private readonly engine: Engine,
@@ -193,6 +199,7 @@ export class Database {
 	/// A query runs in the engine under the lock. If it only adds or replaces parts, which the engine does not show
 	/// until they are committed, the lock is released for the upload and the commit, and other queries run meanwhile.
 	private async run(query: string | Uint8Array, format: string, io: Io, readonly: boolean, timings: Timings, input?: QueryInput): Promise<QueryResult> {
+		this.retry_reason = undefined;
 		for (let attempt = 1; ; ++attempt) {
 			const step = await this.exclusive(() => this.prepare(query, format, io, readonly, timings, input));
 			if (step.kind === "done") {
@@ -207,7 +214,7 @@ export class Database {
 				}
 			}
 			if (attempt === MAX_ATTEMPTS) {
-				return { ok: false, code: 0, message: `The catalog changed during the query ${MAX_ATTEMPTS} times in a row, try again.` };
+				return this.retry_reason ?? { ok: false, code: 0, message: `The catalog changed during the query ${MAX_ATTEMPTS} times in a row, try again.` };
 			}
 		}
 	}
@@ -288,6 +295,12 @@ export class Database {
 					return { ok: false, code: ABORTED, message: "The catalog changed while the query read its data, which streamed: send the query again." };
 				}
 				const result = await this.engine.query(query, format, readonly, reader, body && { reader: body, encoding: input!.encoding });
+				if (!result.ok && result.code === PART_IO_FAILED) {
+					await this.discardChanges();
+					this.state.version = -1;
+					this.retry_reason = result;
+					return "stale";
+				}
 				if (result.ok || result.code !== NOT_FOUND_EXPECTED_DATA_PART || round === MAX_LOAD_ROUNDS) {
 					return result;
 				}

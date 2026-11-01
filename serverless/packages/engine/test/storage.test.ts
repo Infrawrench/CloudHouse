@@ -340,6 +340,19 @@ describe("ObjectMergeTree", () => {
 		expect(await run(a!, "SELECT name = _part FROM vp, system.parts WHERE k = 4 AND table = 'vp' AND partition_id = '1'")).toBe("1\n");
 	});
 
+	it("reads only the columns that a query needs", async () => {
+		const { databases: [a, b], run, reads, parts } = await cluster(2);
+		await run(a!, "CREATE TABLE wide (id UInt64, k LowCardinality(String), big String, other String) ORDER BY id");
+		/// Strings that do not compress, so that they are most of the part.
+		await run(a!, "INSERT INTO wide SELECT number, toString(number % 7), concat(hex(sipHash128(number)), hex(sipHash128(number + 1)), hex(sipHash128(number + 2))), repeat('x', 50) FROM numbers(200000)");
+		const total = (await parts("wide")).reduce((sum, part) => sum + Number(part.split("_")[2]), 0);
+		const before = reads.bytes;
+		expect(await run(b!, "SELECT k, sum(id) FROM wide GROUP BY k ORDER BY k LIMIT 1")).toBe("0\t2857157142\n");
+		/// The index and the chunks of `id` and `k`, not the strings.
+		expect(reads.bytes - before).toBeLessThan(total / 5);
+		expect(await run(a!, "SELECT sum(length(big)), any(other) FROM wide")).toBe("19200000\txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n");
+	});
+
 	it("applies the TTL in merges", async () => {
 		const { databases: [a], run, merge } = await cluster(1);
 		await run(a!, "CREATE TABLE e (ts DateTime, v UInt8) ENGINE = ObjectMergeTree ORDER BY ts TTL ts + INTERVAL 1 DAY");
@@ -386,13 +399,13 @@ describe("ObjectMergeTree", () => {
 		await run(a!, "INSERT INTO s SELECT number, toString(number) FROM numbers(262144)");
 		reads.count = 0;
 		reads.bytes = 0;
-		expect(await run(a!, "SELECT count(), sum(id) FROM s")).toBe("262144\t34359607296\n");
+		expect(await run(a!, "SELECT count(), sum(id), min(v) FROM s")).toBe("262144\t34359607296\t0\n");
 		const all = { ...reads };
 		reads.count = 0;
 		reads.bytes = 0;
-		/// The part has four blocks of 65536 rows: the filter needs one of them.
+		/// The part has sixteen blocks of 16384 rows: the filter needs one of them, a chunk of each of its two columns.
 		expect(await run(a!, "SELECT count(), min(v) FROM s WHERE id BETWEEN 70000 AND 70010")).toBe("11\t70000\n");
-		expect(reads.count).toBe(1);
+		expect(reads.count).toBe(2);
 		expect(reads.bytes).toBeLessThan(all.bytes / 2);
 	});
 
@@ -472,6 +485,20 @@ describe("ObjectMergeTree", () => {
 		await run(a!, `INSERT INTO w SELECT number FROM numbers(40) ${settings}`);
 		expect(await objects()).toBe(before + 4);
 		expect(await run(a!, "SELECT count(), sum(id) FROM w")).toBe("40\t780\n");
+	});
+
+	it("fails a query whose part is gone with an error, and goes on", async () => {
+		const { databases: [a], run, fail, parts } = await cluster(1);
+		await run(a!, "CREATE TABLE gone (id UInt64) ORDER BY id");
+		await run(a!, "INSERT INTO gone VALUES (1)");
+		await run(a!, "CREATE TABLE kept (id UInt64) ORDER BY id");
+		await run(a!, "INSERT INTO kept VALUES (2)");
+		await env.PARTS.delete(partKey((await parts("gone"))[0]!));
+		expect(await fail(a!, "SELECT sum(id) FROM gone")).toContain("RECEIVED_ERROR_FROM_REMOTE_IO_SERVER");
+		/// The engine is not left half way through the query.
+		expect(await run(a!, "SELECT sum(id) FROM kept")).toBe("2\n");
+		await run(a!, "INSERT INTO kept VALUES (3)");
+		expect(await run(a!, "SELECT sum(id) FROM kept")).toBe("5\n");
 	});
 
 	it("keeps the catalog when a query fails", async () => {

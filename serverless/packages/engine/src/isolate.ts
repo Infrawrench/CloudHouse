@@ -23,6 +23,21 @@ function getDatabase(env: Env): Promise<Database> {
 	return database;
 }
 
+/// Runs `work` on the database of this isolate. An exception that escapes it may have left the engine half way through
+/// a query, with its changes neither committed nor cleared: the next work starts with a new engine.
+async function withDatabase<T>(env: Env, work: (db: Database) => Promise<T>): Promise<T> {
+	const current = getDatabase(env);
+	const db = await current;
+	try {
+		return await work(db);
+	} catch (error) {
+		if (database === current) {
+			database = undefined;
+		}
+		throw error;
+	}
+}
+
 /// The static data of the engine is a static asset, because only the module counts against the size limit.
 async function createDatabase(env: Env): Promise<Database> {
 	const response = await env.ASSETS.fetch("https://assets.local/clickhouse-isolate.data");
@@ -139,7 +154,7 @@ export async function runQuery(env: Env, io: Io, request: QueryRequest): Promise
 		}
 		input = bufferedInput(body, request.encoding);
 	}
-	const result = await db.query(text, request.format, io, request.readonly, timings, input);
+	const result = await withDatabase(env, (db) => db.query(text, request.format, io, request.readonly, timings, input));
 	const timing = [
 		...(cold ? [`startup;dur=${startup}`] : []),
 		`sync;dur=${timings.sync}`,
@@ -153,9 +168,9 @@ export async function runQuery(env: Env, io: Io, request: QueryRequest): Promise
 }
 
 export async function runShard(env: Env, io: Io, request: ShardRequest): Promise<ShardAnswer> {
-	return (await getDatabase(env)).shard(request, io);
+	return withDatabase(env, (db) => db.shard(request, io));
 }
 
 export async function runMerge(env: Env, io: Io, message: MergeMessage): Promise<number> {
-	return (await getDatabase(env)).merge(message, io);
+	return withDatabase(env, (db) => db.merge(message, io));
 }

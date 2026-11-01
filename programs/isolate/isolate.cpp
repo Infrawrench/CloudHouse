@@ -59,6 +59,7 @@
 #include <emscripten.h>
 
 #include "ObjectMergeTree.h"
+#include "ObjectPart.h"
 
 #include <filesystem>
 #include <map>
@@ -78,6 +79,7 @@ void registerIsolate();
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int CANNOT_READ_FROM_ISTREAM;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
 }
@@ -321,6 +323,8 @@ private:
     bool nextImpl() override
     {
         const size_t size = ch_host_read_input(internal_buffer.begin(), internal_buffer.size());
+        if (size == static_cast<size_t>(-1))
+            throw Exception(ErrorCodes::CANNOT_READ_FROM_ISTREAM, "Cannot read the body of the request: {}", takeHostError());
         if (size == 0)
             return false;
         working_buffer = Buffer(internal_buffer.begin(), internal_buffer.begin() + size);
