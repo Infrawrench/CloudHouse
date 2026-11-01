@@ -176,9 +176,9 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
 - **Reads.** The engine streams parts: it reads the index of a part, then the blocks that the filter of the query
   may need, with range reads that it waits for (JSPI: `ch_host_read_range` in `host.js`), so it holds a block of
   a part at a time rather than the part. Before reading, it tells the Worker what it is going to read, and the
-  Worker reads up to 16 MiB ahead, several ranges at once (`src/readahead.ts`). The filter skips parts and blocks
+  Worker reads up to 6 MiB ahead, several ranges at once (`src/readahead.ts`). The filter skips parts and blocks
   as `KeyCondition` does for the primary key of `MergeTree`, on the sorting key and the partition key. An isolate
-  keeps the last 16 MiB of ranges it read, and the last 4096 indexes.
+  keeps the last 4 MiB of ranges it read, and the last 4096 indexes.
 - **Catalog.** The definitions of the tables and the list of the parts of every table are in a `Coordination`
   object (`packages/coordination`) of the same Worker, under `/catalog`. Before a query, the isolate syncs with the
   catalog: it reads the version of `/catalog`, one round trip, and only reads the rest if the version has changed.
