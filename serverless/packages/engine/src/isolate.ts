@@ -96,20 +96,21 @@ function cacheRange(key: string, data: Uint8Array): void {
 export function makeIo(env: Env, background: (promise: Promise<unknown>) => void): Io {
 	/// The loopback binding of `PartCache`, which goes through the cache of the Worker.
 	const cache = (exports as unknown as { PartCache: Fetcher }).PartCache;
-	/// Workers Caching keeps the whole part and answers a range from it. Without the cache, as in `wrangler dev`,
-	/// `PartCache` answers with the whole part, and the range is taken from it here.
+	const stats = { pages: 0, bytes: 0, hits: 0 };
 	const fetchRange = async (part: string, offset: number, size: number) => {
-		const response = await cache.fetch(`https://parts/${part}`, { headers: { Range: `bytes=${offset}-${offset + size - 1}` } });
-		if (response.status === 206) {
-			return new Uint8Array(await response.arrayBuffer());
+		const response = await cache.fetch(`https://parts/${part}/${offset}/${size}`);
+		if (response.status !== 200) {
+			throw new Error(`Cannot read part ${part}: ${response.status} ${await response.text()}`);
 		}
-		if (response.status === 200) {
-			return new Uint8Array(await response.arrayBuffer()).slice(offset, offset + size);
-		}
-		throw new Error(`Cannot read part ${part}: ${response.status} ${await response.text()}`);
+		const data = new Uint8Array(await response.arrayBuffer());
+		stats.pages += 1;
+		stats.bytes += data.length;
+		stats.hits += response.headers.get("CF-Cache-Status") === "HIT" ? 1 : 0;
+		return data;
 	};
 	return {
 		background,
+		stats,
 		async readRange(part, offset, size) {
 			const key = `${part}:${offset}:${size}`;
 			const cached = range_cache.get(key);
@@ -136,6 +137,10 @@ export function makeIo(env: Env, background: (promise: Promise<unknown>) => void
 /// parts and shards, and on commits.
 export async function runQuery(env: Env, io: Io, request: QueryRequest): Promise<Answer> {
 	const cold = database === undefined;
+	/// The shards of this engine are likely not running either: they start while it does, rather than when it fans out.
+	if (cold) {
+		io.background(warmShards(env));
+	}
 	const start = Date.now();
 	const db = await getDatabase(env);
 	const startup = Date.now() - start;
@@ -160,11 +165,27 @@ export async function runQuery(env: Env, io: Io, request: QueryRequest): Promise
 		`sync;dur=${timings.sync}`,
 		`load;dur=${timings.load}`,
 		`commit;dur=${timings.commit}`,
-		/// Not a duration: the MiB of linear memory of the engine, which only grows, and of cached ranges.
+		/// Not durations: the MiB of linear memory of the engine, which only grows, and of cached ranges; the ranges that
+		/// the query read, and how many came from the cache; the KiB that they had; the shards that it fanned out to,
+		/// and the time of the slowest.
 		`memory;dur=${Math.round(db.memoryBytes / 1024 / 1024)}`,
 		`cache;dur=${Math.round(range_cache_bytes / 1024 / 1024)}`,
+		`reads;dur=${io.stats.pages}`,
+		`hits;dur=${io.stats.hits}`,
+		`kib;dur=${Math.round(io.stats.bytes / 1024)}`,
+		...(timings.shards ? [`shards;dur=${timings.shards}`, `slowest_shard;dur=${timings.slowest_shard}`] : []),
 	].join(", ");
 	return result.ok ? { ok: true, body: result.body, timing } : { ok: false, code: result.code, message: result.message, timing };
+}
+
+/// Starts the engines of the shards.
+function warmShards(env: Env): Promise<unknown> {
+	const shards = limits(env).maxShards;
+	return Promise.allSettled(Array.from({ length: shards }, (_, i) => env.ENGINE_HOST.get(env.ENGINE_HOST.idFromName(`shard-${i}`)).warm()));
+}
+
+export async function runWarm(env: Env): Promise<void> {
+	await withDatabase(env, (db) => db.warm());
 }
 
 export async function runShard(env: Env, io: Io, request: ShardRequest): Promise<ShardAnswer> {

@@ -141,8 +141,9 @@ that takes more than ten minutes, with status 504.
 
 Every response has `Server-Timing`: `host` (the call to the engine), `startup` (a new engine reading its data),
 `sync` (the catalog), `load` (parts from R2) and `commit`. A Worker's clock only moves on I/O, so the time the
-engine computes is not in it. `memory` and `cache` are not durations but the MiB of memory of the engine and of
-the ranges that its isolate keeps.
+engine computes is not in it. Some are not durations: `memory` and `cache`, the MiB of memory of the engine and of the
+ranges that its isolate keeps; `reads`, `hits` and `kib`, the ranges of parts that the query read, how many came from
+the cache, and their KiB; `shards`, the shards that it fanned out to, with `slowest_shard` the time of the slowest.
 
 #### Workers
 
@@ -245,12 +246,19 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
   shards return their blocks in `Native`, and the queries that the planner splits (aggregation, `ORDER BY ...
   LIMIT`, `DISTINCT`) come out as on a cluster. A query that joins the table with another reads it all in one
   engine, and a point query reads its few blocks in one engine.
-- **Caching.** Engines read parts through `PartCache` (`src/cache.ts`), an entrypoint of the Worker behind Workers
-  Caching, which works on `workers.dev` and in front of loopback calls: a part never changes, so an engine reads it
-  from the cache of its data center if another engine there has read it. The catalog is one atomic read
+- **Caching.** Engines read ranges of parts through `PartCache` (`src/cache.ts`), an entrypoint of the Worker behind
+  Workers Caching, which works on `workers.dev` and in front of loopback calls: a part never changes, so an engine
+  reads a range from the cache of its data center if another engine there has read it. The cache keeps the ranges, not
+  the parts: on a miss, only the range is read from R2, and the ranges that queries read again, such as the indexes
+  of parts, are hits. Caching whole parts made a miss read the whole part, so that an engine that started read every
+  part of a table to read their indexes; caching pages of 1 MiB made every small read a page. The catalog is one atomic read
   (`Coordination.tree`), and every query checks its version, one round trip, so it needs no cache: a cache of
   snapshots in KV would have to be keyed by the version, and every commit makes a new one, which every data center
   would miss once.
+- **Starting.** An engine that has had no query for a minute or two is evicted, and the one that the next query
+  starts compiles the code that the query runs and attaches the tables, about a second. An engine that starts tells
+  the shards to start too (`EngineHost.warm`), so that they are running by the time it fans out, rather than starting
+  one after it.
 - **Memory.** A query can use up to 72 MiB of the memory of an engine, and fails with `MEMORY_LIMIT_EXCEEDED`
   beyond that. Reads and merges stream, so this limits the state of a query (a hash table of `GROUP BY`, a sort, the
   right side of a `JOIN`), not the size of a table. A query puts each part it writes in R2 as soon as it is written,

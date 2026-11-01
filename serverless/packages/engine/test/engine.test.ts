@@ -109,14 +109,23 @@ describe("engine", () => {
 		expect(listed.objects.length).toBeGreaterThan(0);
 	});
 
-	it("serves parts through the cache", async () => {
-		const name = "00000000-0000-4000-8000-000000000000_1_1_all";
-		await env.PARTS.put(`parts/${name}`, new Uint8Array([7]));
+	it("serves ranges of parts through the cache", async () => {
+		const size = 3000;
+		const name = `00000000-0000-4000-8000-000000000000_1_${size}_all`;
+		const data = Uint8Array.from({ length: size }, (_, i) => i % 251);
+		await env.PARTS.put(`parts/${name}`, data);
 		const cache = (exports as unknown as { PartCache: Fetcher }).PartCache;
-		const response = await cache.fetch(`https://parts/${name}`);
+		const response = await cache.fetch(`https://parts/${name}/1000/1500`);
 		expect(response.headers.get("Cache-Control")).toContain("immutable");
-		expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([7]));
-		expect((await cache.fetch("https://parts/00000000-0000-4000-8000-000000000001_1_1_all")).status).toBe(404);
+		expect(new Uint8Array(await response.arrayBuffer())).toEqual(data.slice(1000, 2500));
+		expect((await cache.fetch(`https://parts/${name}/2000/1001`)).status).toBe(400);
+		expect((await cache.fetch("https://parts/00000000-0000-4000-8000-000000000001_1_1_all/0/1")).status).toBe(404);
+	});
+
+	it("warms an engine before its first query", async () => {
+		const host = env.ENGINE_HOST.get(env.ENGINE_HOST.idFromName("shard-0"));
+		await host.warm();
+		expect((await query("SELECT 1")).text).toBe("1\n");
 	});
 
 	it("merges from the queue", async () => {

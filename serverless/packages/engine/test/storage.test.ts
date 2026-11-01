@@ -25,6 +25,7 @@ async function cluster(isolates: number, limits: Partial<Limits> = {}, hooks: { 
 	);
 	const io = (self: number): Io => ({
 		background: (promise) => background.push(promise),
+		stats: { pages: 0, bytes: 0, hits: 0 },
 		async readRange(part, offset, size) {
 			reads.count += 1;
 			reads.bytes += size;

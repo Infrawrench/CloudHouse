@@ -65,6 +65,8 @@ export interface Io {
 	/// Reads the bytes `[offset, offset + size)` of a part: from the cache or R2. The engine calls it while it runs a
 	/// query.
 	readRange(part: string, offset: number, size: number): Promise<Uint8Array>;
+	/// The ranges of parts that the request has read, their bytes, and how many came from the cache.
+	stats: { pages: number; bytes: number; hits: number };
 	/// Runs shard `index` of a fan-out in another engine.
 	runShard(index: number, request: ShardRequest): Promise<ShardAnswer>;
 	/// Queues a merge.
@@ -77,6 +79,9 @@ export interface Timings {
 	sync: number;
 	load: number;
 	commit: number;
+	/// The shards of the fan-outs of the query, and the time of the slowest.
+	shards?: number;
+	slowest_shard?: number;
 }
 
 /// The tables of `ObjectMergeTree` of one isolate: the engine, kept in sync with the catalog, with the parts in R2.
@@ -163,6 +168,21 @@ export class Database {
 		const parts = (await this.catalog.snapshot()).tables.get(key)?.parts ?? [];
 		const gone = request.parts.some((part) => !parts.includes(part));
 		return { ok: false, stale: gone, message: result.message };
+	}
+
+	/// Brings the engine up to date with the catalog, which attaches the tables, and runs a query, which compiles the
+	/// code that queries run first.
+	warm(): Promise<void> {
+		return this.exclusive(async () => {
+			await this.sync();
+			const nothing = async () => {
+				throw new Error("Warming the engine reads no parts");
+			};
+			const result = await this.engine.query("SELECT 1", "", false, { readRange: nothing, prefetch() {}, writePart: nothing });
+			if (!result.ok) {
+				throw new Error(`Cannot warm the engine: ${result.message}`);
+			}
+		});
 	}
 
 	/// Runs a merge from the queue. A merge that loses to a concurrent change runs again against the new catalog.
@@ -312,7 +332,7 @@ export class Database {
 					return result;
 				}
 				const start = Date.now();
-				const fanned = await Promise.all(requests.map((request) => this.fanOut(request, io)));
+				const fanned = await Promise.all(requests.map((request) => this.fanOut(request, io, timings)));
 				timings.load += Date.now() - start;
 				const failed = fanned.find((outcome) => outcome !== "done" && outcome !== "stale");
 				if (failed !== undefined) {
@@ -329,17 +349,21 @@ export class Database {
 	}
 
 	/// Runs the query for the shards of a table on its parts, split among them, and gives the results to the engine.
-	private async fanOut(request: FanOutRequest, io: Io): Promise<"done" | "stale" | { message: string }> {
+	private async fanOut(request: FanOutRequest, io: Io, timings: Timings): Promise<"done" | "stale" | { message: string }> {
 		const table = this.state.tables.get(tableKey(request.database, request.table));
 		if (table === undefined) {
 			throw new Error(`The engine fans out ${request.database}.${request.table}, which is not in the catalog`);
 		}
 		const groups = shardParts(table.parts, this.limits.shardBytes, this.limits.maxShards);
 		const answers = await Promise.all(
-			groups.map((parts, index) =>
-				io.runShard(index, { createQuery: table.createQuery, database: table.database, table: table.table, parts, query: request.query }),
-			),
+			groups.map(async (parts, index) => {
+				const start = Date.now();
+				const answer = await io.runShard(index, { createQuery: table.createQuery, database: table.database, table: table.table, parts, query: request.query });
+				timings.slowest_shard = Math.max(timings.slowest_shard ?? 0, Date.now() - start);
+				return answer;
+			}),
 		);
+		timings.shards = (timings.shards ?? 0) + groups.length;
 		for (const answer of answers) {
 			if (!answer.ok) {
 				return answer.stale ? "stale" : { message: `A shard failed: ${answer.message}` };
