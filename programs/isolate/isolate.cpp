@@ -12,6 +12,9 @@
 #include <Access/MemoryAccessStorage.h>
 #include <Core/Defines.h>
 #include <Databases/DatabaseMemory.h>
+#include <IO/BufferWithOwnMemory.h>
+#include <IO/CompressionMethod.h>
+#include <IO/ConcatReadBuffer.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteHelpers.h>
 #include <IO/SharedThreadPools.h>
@@ -22,12 +25,21 @@
 #include <Interpreters/Session.h>
 #include <Interpreters/executeQuery.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
+#include <Storages/System/StorageSystemAggregateFunctionCombinators.h>
 #include <Storages/System/StorageSystemColumns.h>
+#include <Storages/System/StorageSystemDataTypeFamilies.h>
 #include <Storages/System/StorageSystemDatabases.h>
+#include <Storages/System/StorageSystemFormats.h>
+#include <Storages/System/StorageSystemFunctions.h>
 #include <Storages/System/StorageSystemNumbers.h>
 #include <Storages/System/StorageSystemOne.h>
+#include <Storages/System/StorageSystemSettings.h>
+#include <Storages/System/StorageSystemTableEngines.h>
+#include <Storages/System/StorageSystemTableFunctions.h>
 #include <Storages/System/StorageSystemTables.h>
+#include <Storages/System/StorageSystemTimeZones.h>
 #include <Storages/System/StorageSystemZeros.h>
+#include <Storages/System/attachSystemTablesImpl.h>
 #include <Common/Exception.h>
 #include <Common/Logger.h>
 #include <Common/MemoryTracker.h>
@@ -53,6 +65,10 @@
 #include <sstream>
 
 namespace fs = std::filesystem;
+
+/// Imported from the host (`host.js`): copies up to `size` bytes of the body of the request of the query to `dest`,
+/// and returns how many, 0 at its end. The engine waits for them (JSPI).
+extern "C" size_t ch_host_read_input(char * dest, size_t size);
 
 namespace DB
 {
@@ -108,10 +124,27 @@ constexpr auto users_xml = R"XML(<clickhouse>
             <max_insert_block_size>262144</max_insert_block_size>
             <!-- Shards send single-level aggregation states: there are no two-level ones in an isolate. -->
             <distributed_aggregation_memory_efficient>0</distributed_aggregation_memory_efficient>
+            <!-- What an isolate depends on: a query may lower the memory it uses, but not raise it, nor use threads. -->
+            <constraints>
+                <max_memory_usage><max>67108864</max></max_memory_usage>
+                <max_threads><const/></max_threads>
+                <max_insert_threads><const/></max_insert_threads>
+                <max_final_threads><const/></max_final_threads>
+                <max_parsing_threads><const/></max_parsing_threads>
+                <max_download_threads><const/></max_download_threads>
+                <input_format_parallel_parsing><const/></input_format_parallel_parsing>
+                <output_format_parallel_formatting><const/></output_format_parallel_formatting>
+                <input_format_parquet_enable_row_group_prefetch><const/></input_format_parquet_enable_row_group_prefetch>
+                <use_concurrency_control><const/></use_concurrency_control>
+                <max_bytes_before_external_group_by><const/></max_bytes_before_external_group_by>
+                <max_bytes_before_external_sort><const/></max_bytes_before_external_sort>
+                <distributed_aggregation_memory_efficient><const/></distributed_aggregation_memory_efficient>
+            </constraints>
         </default>
+        <!-- `readonly` = 2: no writes and no DDL, but settings, such as limits, can change within the constraints. -->
         <readonly>
             <profile>default</profile>
-            <readonly>1</readonly>
+            <readonly>2</readonly>
         </readonly>
     </profiles>
     <users>
@@ -122,7 +155,7 @@ constexpr auto users_xml = R"XML(<clickhouse>
             <quota>default</quota>
             <access_management>1</access_management>
         </default>
-        <!-- Queries that may only read: no writes, no DDL, and no changes to the settings. -->
+        <!-- Queries that may only read: no writes and no DDL. -->
         <readonly>
             <password></password>
             <networks><ip>::/0</ip></networks>
@@ -245,6 +278,15 @@ void initialize()
     attachSystemTable(context, *system_database, std::make_shared<StorageSystemColumns>(StorageID(DatabaseCatalog::SYSTEM_DATABASE, "columns")));
     attachSystemParts(context, *system_database);
     attachSystemDetachedParts(context, *system_database);
+    /// What the engine has, for clients that look.
+    attach<StorageSystemSettings>(context, *system_database, "settings", "The settings of the session and their values.");
+    attach<StorageSystemFunctions>(context, *system_database, "functions", "The functions that the engine has.");
+    attach<StorageSystemFormats>(context, *system_database, "formats", "The formats of input and output.");
+    attach<StorageSystemTableEngines>(context, *system_database, "table_engines", "The engines of tables.");
+    attach<StorageSystemTableFunctions>(context, *system_database, "table_functions", "The table functions.");
+    attach<StorageSystemDataTypeFamilies>(context, *system_database, "data_type_families", "The data types.");
+    attach<StorageSystemAggregateFunctionCombinators>(context, *system_database, "aggregate_function_combinators", "The combinators of aggregate functions.");
+    attach<StorageSystemTimeZones>(context, *system_database, "time_zones", "The time zones that the engine knows.");
 
     const String default_database = config->getString("default_database");
     DatabaseCatalog::instance().attachDatabase(default_database, std::make_shared<DatabaseMemory>(default_database, context));
@@ -268,7 +310,27 @@ ContextMutablePtr makeQueryContext(bool readonly)
     return context;
 }
 
-void runQuery(std::string_view query, std::string_view default_format, bool readonly)
+/// The body of the request of a query, which the engine reads from the host as it goes (JSPI), so that it holds a
+/// buffer of it at a time, whatever its size.
+class HostInputReadBuffer final : public BufferWithOwnMemory<ReadBuffer>
+{
+public:
+    HostInputReadBuffer() : BufferWithOwnMemory<ReadBuffer>(1024 * 1024) {}
+
+private:
+    bool nextImpl() override
+    {
+        const size_t size = ch_host_read_input(internal_buffer.begin(), internal_buffer.size());
+        if (size == 0)
+            return false;
+        working_buffer = Buffer(internal_buffer.begin(), internal_buffer.begin() + size);
+        return true;
+    }
+};
+
+/// Runs a query, as the HTTP interface does: its text is `query`, then the body of the request if `with_input`,
+/// which is compressed with `input_encoding` (`Content-Encoding`: `gzip`, `zstd`, ...), or not if it is empty.
+void runQuery(std::string_view query, std::string_view default_format, bool readonly, bool with_input, std::string_view input_encoding)
 {
     auto context = makeQueryContext(readonly);
     if (!default_format.empty())
@@ -276,7 +338,12 @@ void runQuery(std::string_view query, std::string_view default_format, bool read
 
     auto query_scope = QueryScope::create(context);
 
-    ReadBufferFromMemory in(query.data(), query.size());
+    ConcatReadBuffer::Buffers buffers;
+    buffers.push_back(std::make_unique<ReadBufferFromMemory>(query.data(), query.size()));
+    if (with_input)
+        buffers.push_back(wrapReadBufferWithCompressionMethod(
+            std::make_unique<HostInputReadBuffer>(), chooseCompressionMethod({}, String{input_encoding})));
+    ConcatReadBuffer in(std::move(buffers));
     WriteBufferFromString out(result);
     executeQuery(in, out, context, /* set_result_details= */ {});
     out.finalize();
@@ -385,17 +452,17 @@ String formatChanges()
                     }
                     writeChar(']', out);
                 }
-                writeCString(",\"copied\":[", out);
-                for (size_t i = 0; i < change.copied.size(); ++i)
+                writeCString(",\"shared\":[", out);
+                for (size_t i = 0; i < change.shared.size(); ++i)
                 {
                     if (i)
                         writeChar(',', out);
-                    writeCString("{\"from\":", out);
-                    writeJSONString(change.copied[i].first, out, {});
-                    writeCString(",\"to\":", out);
-                    writeJSONString(change.copied[i].second, out, {});
-                    writeChar('}', out);
+                    writeJSONString(change.shared[i], out, {});
                 }
+                writeCString("],\"shared_from\":[", out);
+                writeJSONString(change.shared_from.first, out, {});
+                writeChar(',', out);
+                writeJSONString(change.shared_from.second, out, {});
                 writeChar(']', out);
                 break;
         }
@@ -447,11 +514,12 @@ extern "C"
 {
 
 int ch_isolate_init();
-int ch_isolate_query(const char * query, size_t query_size, const char * default_format, size_t default_format_size, int readonly);
+int ch_isolate_query(
+    const char * query, size_t query_size, const char * default_format, size_t default_format_size, int readonly, int with_input,
+    const char * input_encoding, size_t input_encoding_size);
 int ch_isolate_host_query(const char * query, size_t query_size);
 int ch_isolate_set_parts(const char * spec, size_t spec_size);
 int ch_isolate_changes();
-int ch_isolate_change_data(size_t index);
 int ch_isolate_clear_changes();
 int ch_isolate_set_fanout(const char * spec, size_t spec_size);
 int ch_isolate_fanout_requests();
@@ -474,10 +542,13 @@ EMSCRIPTEN_KEEPALIVE int ch_isolate_init()
     return DB::run([] { if (!DB::isolate) DB::initialize(); });
 }
 
-/// Runs one query, with the data of an `INSERT` following it in the same text, like the HTTP interface.
-/// `default_format` applies when the query has no `FORMAT` clause; empty means `TabSeparated`. A `readonly` query
-/// runs as the user `readonly`, with the setting `readonly` = 1.
-EMSCRIPTEN_KEEPALIVE int ch_isolate_query(const char * query, size_t query_size, const char * default_format, size_t default_format_size, int readonly)
+/// Runs one query, with the data of an `INSERT` following it, like the HTTP interface: in the same text, or, if
+/// `with_input`, in the body of the request, which the engine reads from the host (`ch_host_read_input`), compressed
+/// with `input_encoding` if it is not empty. `default_format` applies when the query has no `FORMAT` clause; empty
+/// means `TabSeparated`. A `readonly` query runs as the user `readonly`, with the setting `readonly` = 2.
+EMSCRIPTEN_KEEPALIVE int ch_isolate_query(
+    const char * query, size_t query_size, const char * default_format, size_t default_format_size, int readonly, int with_input,
+    const char * input_encoding, size_t input_encoding_size)
 {
     return DB::run([&]
     {
@@ -487,7 +558,8 @@ EMSCRIPTEN_KEEPALIVE int ch_isolate_query(const char * query, size_t query_size,
         /// The changes of one query are committed together, so the host clears them before the next query.
         if (!store.getChanges().empty())
             throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "The changes of the previous query are neither committed nor cleared");
-        DB::runQuery({query, query_size}, {default_format, default_format_size}, readonly != 0);
+        DB::runQuery(
+            {query, query_size}, {default_format, default_format_size}, readonly != 0, with_input != 0, {input_encoding, input_encoding_size});
     });
 }
 
@@ -500,7 +572,7 @@ EMSCRIPTEN_KEEPALIVE int ch_isolate_host_query(const char * query, size_t query_
         auto & store = DB::ObjectPartStore::instance();
         store.setHostQuery(true);
         SCOPE_EXIT(store.setHostQuery(false));
-        DB::runQuery({query, query_size}, {}, /* readonly= */ false);
+        DB::runQuery({query, query_size}, {}, /* readonly= */ false, /* with_input= */ false, {});
     });
 }
 
@@ -532,18 +604,6 @@ EMSCRIPTEN_KEEPALIVE int ch_isolate_set_parts(const char * spec, size_t spec_siz
 EMSCRIPTEN_KEEPALIVE int ch_isolate_changes()
 {
     return DB::run([] { DB::result = DB::formatChanges(); });
-}
-
-/// The data of the part that change `index` adds.
-EMSCRIPTEN_KEEPALIVE int ch_isolate_change_data(size_t index)
-{
-    return DB::run([&]
-    {
-        const auto & changes = DB::ObjectPartStore::instance().getChanges();
-        if (index >= changes.size() || changes[index].added.empty())
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Change {} adds no part", index);
-        DB::result = changes[index].added_data;
-    });
 }
 
 /// The host has committed the changes of the last query, or given up on them.

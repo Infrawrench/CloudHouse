@@ -125,8 +125,19 @@ parameter or the `POST` body, `default_format`, and exceptions as status 500 wit
 `X-ClickHouse-Exception-Code`. Every request except `/ping` needs `Authorization: Bearer <token>`:
 
 - `ENGINE_TOKEN` gives full access;
-- `ENGINE_READONLY_TOKEN`, if set, runs the query as the user `readonly`, with the setting `readonly` = 1: no
-  writes, no DDL, no `SET`. The Worker also refuses to commit any change to the catalog from such a query.
+- `ENGINE_READONLY_TOKEN`, if set, runs the query as the user `readonly`, with the setting `readonly` = 2: no
+  writes and no DDL, but its settings can change, so that a client can tighten `max_execution_time` or
+  `max_result_rows`. The Worker also refuses to commit any change to the catalog from such a query.
+
+The profile pins what an isolate depends on: no query can raise `max_memory_usage` above 64 MiB or change the
+settings of threads.
+
+With a `query` parameter, the body is the data that follows it, and it streams to the engine, which reads it as it
+parses (`ch_host_read_input`), whatever its size: an `INSERT` writes a part every 262,144 rows. Without one, the body
+is the query, at most 16 MiB. A body with `Content-Encoding` (`gzip`, `deflate`, `br`, `zstd`, `lz4`, `xz`, `bz2`) is
+decompressed by the engine. A query that fails in the platform rather than in the engine, for example because a
+deployment reset its Durable Object, is answered with status 503 and the code 1002, and can be sent again; a query
+that takes more than ten minutes, with status 504.
 
 Every response has `Server-Timing`: `host` (the call to the engine), `startup` (a new engine reading its data),
 `sync` (the catalog), `load` (parts from R2) and `commit`. A Worker's clock only moves on I/O, so the time the
@@ -177,6 +188,8 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
     replaces are still there, so concurrent inserts do not conflict. An `ALTER` between them makes the `INSERT` run
     again against the new definition.
 - **Merges.** After a commit leaves a partition with 8 parts or more, it queues a merge (`clickhouse-engine-merges`).
+  The merges of a table run in one `EngineHost` (`merge-<table>`), one at a time, so that they do not choose the
+  same parts and lose to each other.
   The consumer merges the smallest parts of a partition, as many as fit in 4 MiB and 10 parts (`src/parts.ts`),
   streaming them through `MergingSortedTransform`, and deletes the replaced parts.
 - **TTL.** `TTL <expression>` of the table deletes rows and `TTL <expression>` of a column resets its values to the
@@ -206,14 +219,23 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
 - **Partitions.** `DROP PARTITION`, `DETACH PARTITION` and `ATTACH PARTITION` (by value, by `ID`, or a `PART` by its
   name), `DROP DETACHED PARTITION` (with `allow_drop_detached`), `ATTACH PARTITION ... FROM`, `REPLACE PARTITION ...
   FROM` and `MOVE PARTITION ... TO TABLE`, as in `MergeTree`. A detached part stays in the catalog, marked
-  `detached`, and in `system.detached_parts`. The parts of another table are copied in R2 before the commit, so
-  that a part belongs to one table. `FREEZE` and `FETCH` are refused: there is no file system to freeze into, and
+  `detached`, and in `system.detached_parts`. The parts of another table are shared rather than copied: a part
+  never changes, so `ATTACH`, `REPLACE` and `MOVE PARTITION` are one commit of the catalog, which checks that the
+  other table still has the parts, and take the time of a small query whatever the size of the partition (0.5 s for
+  6 million rows in 37 parts, 3.3 s for 23 million rows in 112 parts). A part is deleted from R2 when no table has
+  it. A table has a part once, so attaching the same parts twice is refused. `FREEZE` and `FETCH` are refused: there is no file system to freeze into, and
   no replicas to fetch from.
 - **Databases.** `CREATE DATABASE` (the engine `Atomic`, the default) puts the database in the catalog, so every
   isolate has it, and `DROP DATABASE` drops its tables, then it. `ENGINE = Memory` makes a database of one engine.
 - **`RENAME TABLE` and `EXCHANGE TABLES`** move tables, with their parts, to new names or other databases, in one
   commit.
-- **`system.parts`** lists the parts of every table, with their partition, rows and bytes.
+- **`system.parts`** lists the parts of every table, with their partition (`partition`, for the parts written since
+  2026-11-01, and `partition_id`), rows and bytes. The virtual columns `_part` and `_partition_id` give the part of
+  each row. `system.settings`, `functions`, `formats`, `table_engines`, `table_functions`, `data_type_families`,
+  `aggregate_function_combinators` and `time_zones` are there too.
+- **Reads during writes.** A shard runs on the parts that its coordinator gives it, with the same definition of the
+  table, at whatever version of the catalog it has: parts never change, so writes to other partitions and tables
+  meanwhile do not make a read run again.
 - **Fan-out.** A query that reads one table alone, and that needs more than 4 MiB of its blocks after the filter
   skips what it can, fans out. It is processed by shards up to `WithMergeableState`, as for a `Distributed` table,
   and finished by the engine that got it. Each shard is an `EngineHost` (`shard-<n>`) that reads about 4 MiB of the
@@ -229,9 +251,12 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
   would miss once.
 - **Memory.** A query can use up to 72 MiB of the memory of an engine, and fails with `MEMORY_LIMIT_EXCEEDED`
   beyond that. Reads and merges stream, so this limits the state of a query (a hash table of `GROUP BY`, a sort, the
-  right side of a `JOIN`), not the size of a table. A query holds the parts it writes until it commits, so
-  `OPTIMIZE TABLE ... FINAL` of a whole large table runs out of memory: optimize it a partition at a time, or let the
-  queued merges, which take a few parts at a time, do it. `uniqExact` of 2 million distinct strings is beyond it, while
+  right side of a `JOIN`), not the size of a table. A query puts each part it writes in R2 as soon as it is written,
+  and holds none of them until it commits. The ranges of parts that the Worker reads ahead (6 MiB) and caches (4
+  MiB), and the runs of blocks that it reads at once (2 MiB), are small, because they share the 128 MB of the
+  isolate with the engine, which may grow to 100 MiB. Before, a large `INSERT ... SELECT` could exceed the memory of
+  the isolate, which Cloudflare then resets. `OPTIMIZE TABLE ... FINAL` of 88 MiB in 16 partitions takes 26 s.
+  `uniqExact` of 2 million distinct strings is beyond it, while
   `uniq` is not.
 - **Garbage.** An hourly Cron Trigger (`src/garbage.ts`) deletes the parts in R2 that no table has and that are
   older than an hour: the parts of a commit that failed and were not deleted then. A bucket belongs to one catalog.
@@ -304,6 +329,11 @@ npx wrangler deploy
 cd ../gateway && npx wrangler deploy
 npx wrangler secret put ENGINE_TOKEN             # on the gateway
 npx wrangler secret put ENGINE_READONLY_TOKEN    # optional
+
+# Another deployment, with tables of its own: the environment `instances` of both `wrangler.jsonc` files has its own
+# Workers, Durable Objects, bucket and queue, and a custom domain.
+npx wrangler r2 bucket create cloudhouse-instances-parts && npx wrangler queues create cloudhouse-instances-merges
+npx wrangler deploy --env instances && (cd ../gateway && npx wrangler deploy --env instances)
 ```
 
 What the isolate build changes, under `OS_WASM_ISOLATE`:

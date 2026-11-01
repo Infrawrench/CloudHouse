@@ -242,7 +242,11 @@ export class Catalog {
 						detached.get(key)?.delete(part);
 						parts.get(key)?.add(part);
 					}
-					for (const part of [...(change.added === null ? [] : [change.added]), ...change.copied.map((copy) => copy.to)]) {
+					/// A table shares a part of another table that has it still.
+					for (const part of change.shared) {
+						ops.push({ type: "check", path: partPath(change.shared_from[0], change.shared_from[1], part), version: -1 });
+					}
+					for (const part of [...(change.added === null ? [] : [change.added]), ...change.shared]) {
 						ops.push({ type: "create", path: path(part) });
 						parts.get(key)?.add(part);
 					}

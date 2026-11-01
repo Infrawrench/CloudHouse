@@ -1,8 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
-import type { ShardAnswer, ShardRequest } from "./database";
+import type { MergeMessage, ShardAnswer, ShardRequest } from "./database";
 import type { Env } from "./env";
-import type { Answer } from "./http";
-import { makeIo, runQuery, runShard } from "./isolate";
+import type { Answer, QueryRequest } from "./http";
+import { makeIo, runMerge, runQuery, runShard } from "./isolate";
 
 /// An engine in a Durable Object. A Durable Object stays on one machine, in one isolate, so its engine stays warm
 /// between queries, where the isolates that Cloudflare picks for requests start a new engine more often than not
@@ -10,12 +10,18 @@ import { makeIo, runQuery, runShard } from "./isolate";
 /// query that fans out runs its shards on others (`shard-<n>`). The engine is the same as in a Worker: it syncs with
 /// the catalog before every query.
 export class EngineHost extends DurableObject<Env> {
-	async query(text: Uint8Array, format: string, readonly: boolean): Promise<Answer> {
-		return runQuery(this.env, this.io(), text, format, readonly);
+	async query(request: QueryRequest): Promise<Answer> {
+		return runQuery(this.env, this.io(), request);
 	}
 
 	async shard(request: ShardRequest): Promise<ShardAnswer> {
 		return runShard(this.env, this.io(), request);
+	}
+
+	/// The merges of a table run in one object (`merge-<database>.<table>`), one at a time, so that they do not choose
+	/// the same parts and lose to each other.
+	async merge(message: MergeMessage): Promise<number> {
+		return runMerge(this.env, this.io(), message);
 	}
 
 	private io() {

@@ -1,5 +1,5 @@
 import type { EngineHost } from "./host";
-import type { Answer } from "./http";
+import type { Answer, QueryRequest } from "./http";
 
 /// `ENGINE_POOL`: how many `EngineHost` objects the queries are spread over.
 export function poolSize(value: string | undefined): number {
@@ -14,15 +14,13 @@ export function poolSize(value: string | undefined): number {
 export async function askPool(
 	hosts: DurableObjectNamespace<EngineHost>,
 	pool: number,
-	text: Uint8Array,
-	format: string,
-	readonly: boolean,
+	request: QueryRequest,
 	session: string | null = null,
 ): Promise<Answer> {
 	const index = session === null ? Math.floor(Math.random() * pool) : hash(session) % pool;
 	const host = hosts.get(hosts.idFromName(`engine-${index}`));
 	const start = Date.now();
-	const answer = await host.query(text, format, readonly);
+	const answer = await host.query(request);
 	return { ...answer, timing: `host;dur=${Date.now() - start}, ${answer.timing}` };
 }
 

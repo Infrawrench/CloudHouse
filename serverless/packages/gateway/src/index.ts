@@ -16,6 +16,6 @@ export default {
 		if (pool === 0) {
 			throw new Error("The gateway needs ENGINE_POOL of at least one engine");
 		}
-		return handleRequest(request, env, (text, format, readonly, session) => askPool(env.ENGINES, pool, text, format, readonly, session));
+		return handleRequest(request, env, (query, session) => askPool(env.ENGINES, pool, query, session));
 	},
 } satisfies ExportedHandler<Env>;

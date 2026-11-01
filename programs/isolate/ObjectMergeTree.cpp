@@ -1,6 +1,7 @@
 #include "ObjectMergeTree.h"
 #include "ObjectPart.h"
 
+#include <Analyzer/AggregationUtils.h>
 #include <Analyzer/QueryNode.h>
 #include <Columns/ColumnConst.h>
 #include <Analyzer/TableNode.h>
@@ -292,6 +293,18 @@ void checkTTL(const TTLTableDescription & ttl)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "The TTL of ObjectMergeTree can only delete rows, without WHERE");
 }
 
+/// The value of the partition of the rows of `block`, which are all in one partition, as `system.parts` shows it.
+String partitionText(const StorageMetadataPtr & metadata, const Block & block, const ContextPtr & context)
+{
+    if (!metadata->hasPartitionKey())
+        return "tuple()";
+    MergeTreePartition partition;
+    partition.create(metadata, block, 0, context);
+    WriteBufferFromOwnString out;
+    partition.serializeText(metadata->getPartitionKey().sample_block, out, FormatSettings{});
+    return out.str();
+}
+
 /// The id of the partition that `ALTER TABLE ... PARTITION <value>` names, as `MergeTreePartition::getID`.
 String partitionIdFromAST(const ASTPartition & partition, const StorageInMemoryMetadata & metadata, const ContextPtr & context)
 {
@@ -386,7 +399,9 @@ public:
         }
         const auto skip = skipConditions(skip_indices, filter_actions_dag ? filter_actions_dag->getOutputs().front() : nullptr, context);
 
-        auto columns = storage_snapshot->getColumnsByNames(GetColumnsOptions(GetColumnsOptions::All).withSubcolumns(), required_source_columns);
+        auto columns = storage_snapshot->getColumnsByNames(
+            GetColumnsOptions(GetColumnsOptions::All).withSubcolumns().withVirtuals(VirtualsKind::All, VirtualsMaterializationPlace::Reader),
+            required_source_columns);
         for (const auto & part : parts)
             prefetchPartIndex(part, ObjectPartName::parse(part).bytes);
         std::vector<std::tuple<String, ObjectPartIndexPtr, std::vector<size_t>>> chosen;
@@ -484,6 +499,12 @@ public:
         /// With a `JOIN` or an `ARRAY JOIN`, the other side would have to go to the shards too.
         const auto * query_node = query_info.query_tree ? query_info.query_tree->as<QueryNode>() : nullptr;
         if (!query_node || !query_info.table_expression || query_node->getJoinTreeNode().get() != query_info.table_expression.get())
+            return QueryProcessingStage::FetchColumns;
+        /// A shard sends back its result at once, so only a query that the shards reduce fans out: an aggregation, a
+        /// `DISTINCT` or a `LIMIT`. The rows of the others stream from here.
+        const bool reduces = query_node->hasGroupBy() || hasAggregateFunctionNodes(query_node->getProjectionNode())
+            || query_node->isDistinct() || query_node->hasLimit();
+        if (!reduces)
             return QueryProcessingStage::FetchColumns;
         /// A query that its filter keeps to a few blocks, such as a point query, reads them here.
         if (selectedBytes(query_info, context) <= fan_out_bytes)
@@ -622,6 +643,8 @@ public:
                 Block physical = physicalColumns(block, header);
                 if (materialize_ttl)
                     applyTTL(physical, *metadata_snapshot, context);
+                if (writer.rows() == 0 && physical.rows() > 0)
+                    writer.setPartition(partitionText(metadata_snapshot, physical, context));
                 writer.write(physical);
             }
             addPart(writer, ObjectPartName::parse(part).partition_id, {part});
@@ -754,7 +777,8 @@ public:
     }
 
     /// The commands on partitions, as in `MergeTree`. They only change which parts the table and its detached parts
-    /// have, except that the parts of another table are copied, so that each part belongs to one table.
+    /// have. The parts of another table are shared, not copied, so that `REPLACE PARTITION ... FROM` and `MOVE PARTITION`
+    /// are one commit of the catalog, whatever the size of the partition.
     Pipe alterPartition(const StorageMetadataPtr & metadata_snapshot, const PartitionCommands & commands, ContextPtr context) override
     {
         auto & store = ObjectPartStore::instance();
@@ -798,14 +822,16 @@ public:
                     break;
                 case PartitionCommand::REPLACE_PARTITION:
                 {
-                    /// `ATTACH PARTITION ... FROM` copies the parts of the partition of the other table, and `REPLACE
+                    /// `ATTACH PARTITION ... FROM` adds the parts of the partition of the other table, and `REPLACE
                     /// PARTITION ... FROM` also removes the parts of the partition of this one.
                     const auto source = DatabaseCatalog::instance().getTable({context->resolveDatabase(command.from_database), command.from_table}, context);
                     const auto & other = checkSameStructure(source, metadata_snapshot, context);
+                    const auto other_id = other.getStorageID();
                     const String id = partition_id();
-                    for (const auto & part : store.getVisibleParts(other.getStorageID()))
+                    for (const auto & part : store.getVisibleParts(other_id))
                         if (ObjectPartName::parse(part).partition_id == id)
-                            change.copied.emplace_back(part, copyName(part));
+                            change.shared.push_back(part);
+                    change.shared_from = {other_id.database_name, other_id.table_name};
                     if (command.replace)
                         change.removed = select(store.getVisibleParts(table_id));
                     break;
@@ -815,19 +841,33 @@ public:
                     const auto destination = DatabaseCatalog::instance().getTable({context->resolveDatabase(command.to_database), command.to_table}, context);
                     const auto & other = checkSameStructure(destination, metadata_snapshot, context);
                     const auto other_id = other.getStorageID();
+                    /// The destination gets the parts before this table gives them up, in the same commit.
                     CatalogChange moved{.kind = CatalogChange::Kind::ReplaceParts, .database = other_id.database_name, .table = other_id.table_name};
                     change.removed = select(store.getVisibleParts(table_id));
-                    for (const auto & part : change.removed)
-                        moved.copied.emplace_back(part, copyName(part));
-                    if (!moved.copied.empty())
+                    moved.shared = change.removed;
+                    moved.shared_from = {table_id.database_name, table_id.table_name};
+                    const auto destination_parts = store.getVisibleParts(other_id);
+                    for (const auto & part : moved.shared)
+                        if (std::find(destination_parts.begin(), destination_parts.end(), part) != destination_parts.end())
+                            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table {} has part {} already", other_id.getNameForLogs(), part);
+                    if (!moved.shared.empty())
                         store.addChange(std::move(moved));
                     break;
                 }
                 default:
                     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "ObjectMergeTree has no {}", command.typeToString());
             }
+            /// A table has a part once: the parts of another table can be attached to it once.
+            for (const auto & part : change.shared)
+            {
+                const auto visible = store.getVisibleParts(table_id);
+                if (std::find(visible.begin(), visible.end(), part) != visible.end()
+                    && std::find(change.removed.begin(), change.removed.end(), part) == change.removed.end())
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table {} has part {} already, from {}.{}",
+                        table_id.getNameForLogs(), part, change.shared_from.first, change.shared_from.second);
+            }
             if (!change.removed.empty() || !change.detached.empty() || !change.attached.empty() || !change.dropped_detached.empty()
-                || !change.copied.empty())
+                || !change.shared.empty())
                 store.addChange(std::move(change));
         }
         return {};
@@ -885,15 +925,8 @@ public:
         });
     }
 
-    /// The name of a copy of a part, for another table.
-    static String copyName(const String & part)
-    {
-        auto name = ObjectPartName::parse(part);
-        name.uuid = toString(UUIDHelpers::generateV4());
-        return name.toString();
-    }
-
-    /// Adds the part that `writer` wrote in place of the parts `removed`. A part without rows only removes them.
+    /// Adds the part that `writer` wrote in place of the parts `removed`. A part without rows only removes them. The
+    /// host puts the part in object storage now, so that a query that writes many parts holds one at a time.
     void addPart(ObjectPartWriter & writer, const String & partition_id, Strings removed) const
     {
         auto & store = ObjectPartStore::instance();
@@ -902,10 +935,11 @@ public:
         if (writer.rows() > 0)
         {
             change.added_rows = writer.rows();
-            change.added_data = writer.finish();
+            const String data = writer.finish();
             change.added = ObjectPartName{
-                .uuid = toString(UUIDHelpers::generateV4()), .rows = change.added_rows, .bytes = change.added_data.size(), .partition_id = partition_id}
+                .uuid = toString(UUIDHelpers::generateV4()), .rows = change.added_rows, .bytes = data.size(), .partition_id = partition_id}
                                .toString();
+            writePart(change.added, data);
         }
         else if (change.removed.empty())
         {
@@ -987,6 +1021,8 @@ private:
         {
             Block physical_block = physicalColumns(block, header);
             expired |= applyTTL(physical_block, *metadata, context);
+            if (writer.rows() == 0 && physical_block.rows() > 0)
+                writer.setPartition(partitionText(metadata, physical_block, context));
             writer.write(physical_block);
         }
         if (parts.size() == 1 && !expired && !force)
@@ -1105,6 +1141,7 @@ public:
             Block rows = std::move(*part.block);
             sortBySortingKey(rows, *metadata_snapshot);
             ObjectPartWriter writer = storage.partWriter(metadata_snapshot);
+            writer.setPartition(partitionText(metadata_snapshot, rows, context));
             writer.write(rows);
             storage.addPart(writer, partition_id, {});
         }
@@ -1129,6 +1166,11 @@ public:
 
     std::string getName() const override { return "SystemObjectParts"; }
 
+protected:
+    bool supportsColumnsMask() const override { return true; }
+
+public:
+
     static ColumnsDescription getColumnsDescription()
     {
         auto string = std::make_shared<DataTypeString>();
@@ -1137,6 +1179,7 @@ public:
             {"database", string, "The database of the table."},
             {"table", string, "The table."},
             {"name", string, "The name of the part: its UUID, rows, bytes and partition."},
+            {"partition", string, "The value of the partition of the part. Empty for the parts written before it was kept."},
             {"partition_id", string, "The id of the partition of the part."},
             {"rows", uint64, "The number of rows of the part."},
             {"bytes_on_disk", uint64, "The size of the part in object storage."},
@@ -1145,21 +1188,35 @@ public:
     }
 
 protected:
-    void fillData(MutableColumns & res_columns, ContextPtr /*context*/, const ActionsDAG::Node * /*predicate*/, std::vector<UInt8> /*columns_mask*/) const override
+    void fillData(MutableColumns & res_columns, ContextPtr /*context*/, const ActionsDAG::Node * /*predicate*/, std::vector<UInt8> columns_mask) const override
     {
-        for (const auto & [table, parts] : ObjectPartStore::instance().allVisibleParts())
+        const auto & all = ObjectPartStore::instance().allVisibleParts();
+        /// The value of the partition is in the index of the part, which is read only if the query needs it.
+        const bool with_partition = columns_mask.at(3) != 0;
+        if (with_partition)
+            for (const auto & [table, parts] : all)
+                for (const auto & part : parts)
+                    prefetchPartIndex(part, ObjectPartName::parse(part).bytes);
+        for (const auto & [table, parts] : all)
         {
             for (const auto & part : parts)
             {
                 const auto name = ObjectPartName::parse(part);
-                size_t i = 0;
-                res_columns[i++]->insert(table.first);
-                res_columns[i++]->insert(table.second);
-                res_columns[i++]->insert(part);
-                res_columns[i++]->insert(name.partition_id);
-                res_columns[i++]->insert(name.rows);
-                res_columns[i++]->insert(name.bytes);
-                res_columns[i++]->insert(1);
+                size_t source = 0;
+                size_t result = 0;
+                auto insert = [&](const Field & value)
+                {
+                    if (columns_mask[source++])
+                        res_columns[result++]->insert(value);
+                };
+                insert(table.first);
+                insert(table.second);
+                insert(part);
+                insert(with_partition ? readPartIndex(part, name.bytes)->partition : String{});
+                insert(name.partition_id);
+                insert(name.rows);
+                insert(name.bytes);
+                insert(1);
             }
         }
     }
@@ -1472,6 +1529,7 @@ void registerStorageObjectMergeTree(StorageFactory & factory)
         auto storage_settings = tableSettings(settingsChanges(storage_def), context);
         StorageInMemoryMetadata metadata;
         metadata.setColumns(args.columns);
+        metadata.setVirtuals(objectPartVirtuals());
         metadata.setComment(args.comment);
         if (storage_def.settings)
             metadata.settings_changes = storage_def.settings->ptr();

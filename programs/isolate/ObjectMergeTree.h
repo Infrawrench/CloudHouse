@@ -84,15 +84,15 @@ struct CatalogChange
     /// `ReplaceParts`.
     String added = {};
     UInt64 added_rows = 0;
-    String added_data = {};
     Strings removed = {};
     /// `ReplaceParts`, for the commands on partitions: parts that are detached, detached parts that are attached again,
-    /// detached parts that are deleted, and copies of the parts of another table, `{part, copy}`, which the host makes
-    /// before it commits.
+    /// detached parts that are deleted, and parts of the table `shared_from` that the table gets too. A part never
+    /// changes, so tables share it rather than copy it: it is deleted when no table has it.
     Strings detached = {};
     Strings attached = {};
     Strings dropped_detached = {};
-    std::vector<std::pair<String, String>> copied = {};
+    Strings shared = {};
+    std::pair<String, String> shared_from = {};
 };
 
 /// The query for the shards of a table that fans out.

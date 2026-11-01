@@ -41,15 +41,40 @@ describe("engine", () => {
 		const read = (query: string) =>
 			SELF.fetch("http://engine/", { method: "POST", body: query, headers: { Authorization: "Bearer read-token" } });
 		expect(await (await read("SELECT 1")).text()).toBe("1\n");
-		for (const query of [
-			"CREATE TABLE r (a UInt8) ENGINE = ObjectMergeTree",
-			"CREATE TABLE r (a UInt8) ENGINE = Memory",
-			"SET max_threads = 2",
-		]) {
+		for (const query of ["CREATE TABLE r (a UInt8) ENGINE = ObjectMergeTree", "CREATE TABLE r (a UInt8) ENGINE = Memory"]) {
 			const response = await read(query);
 			expect(response.status).toBe(500);
 			expect(response.headers.get("X-ClickHouse-Exception-Code")).toBe("164");
 		}
+		/// It can tighten its limits, within the constraints of the profile.
+		expect(await (await read("SELECT number FROM numbers(3) SETTINGS max_result_rows = 10, max_execution_time = 5")).text()).toBe("0\n1\n2\n");
+		const threads = await read("SELECT 1 SETTINGS max_threads = 4");
+		expect(threads.headers.get("X-ClickHouse-Exception-Code")).toBe("452");
+	});
+
+	it("streams the data of an insert, compressed or not", async () => {
+		await query("CREATE TABLE streamed (x UInt32, y String) ORDER BY x");
+		const rows = Array.from({ length: 200000 }, (_, i) => JSON.stringify({ x: i, y: "y".repeat(80) })).join("\n");
+		const url = `http://engine/?query=${encodeURIComponent("INSERT INTO streamed FORMAT JSONEachRow")}`;
+		/// A body that streams, without a length.
+		const body = new Blob([rows]).stream();
+		expect((await SELF.fetch(url, { method: "POST", body, headers: authorization, duplex: "half" } as RequestInit)).status).toBe(200);
+		const gzip = new Blob([rows]).stream().pipeThrough(new CompressionStream("gzip"));
+		const compressed = new Uint8Array(await new Response(gzip).arrayBuffer());
+		const response = await SELF.fetch(url, { method: "POST", body: compressed, headers: { ...authorization, "Content-Encoding": "gzip" } });
+		expect(response.status).toBe(200);
+		expect((await query("SELECT count(), sum(x) FROM streamed")).text).toBe("400000\t39999800000\n");
+		/// A query in a compressed body.
+		const select = new Uint8Array(await new Response(new Blob(["SELECT count() FROM streamed"]).stream().pipeThrough(new CompressionStream("deflate"))).arrayBuffer());
+		const answer = await SELF.fetch("http://engine/", { method: "POST", body: select, headers: { ...authorization, "Content-Encoding": "deflate" } });
+		expect(await answer.text()).toBe("400000\n");
+	});
+
+	it("has the system tables that clients look at", async () => {
+		expect((await query("SELECT value FROM system.settings WHERE name = 'max_threads'")).text).toBe("1\n");
+		expect((await query("SELECT count() > 100 FROM system.functions")).text).toBe("1\n");
+		expect((await query("SELECT is_input, is_output FROM system.formats WHERE name = 'Parquet'")).text).toBe("1\t1\n");
+		expect((await query("SELECT count() FROM system.table_engines WHERE name = 'MergeTree'")).text).toBe("1\n");
 	});
 
 	it("runs a query", async () => {
@@ -70,7 +95,7 @@ describe("engine", () => {
 			status: 200,
 			text: '[["a","b","c"], 6]\n',
 		});
-		expect(await query("SHOW TABLES")).toMatchObject({ status: 200, text: "t\n" });
+		expect(await query("SHOW TABLES LIKE 't'")).toMatchObject({ status: 200, text: "t\n" });
 	});
 
 	it("keeps tables of ObjectMergeTree in the catalog and in R2", async () => {

@@ -1,6 +1,7 @@
 import { type Catalog, type Snapshot, type Table, tableKey } from "./catalog";
 import { type CatalogChange, type Engine, type FanOutRequest, NOT_FOUND_EXPECTED_DATA_PART, type QueryResult } from "./engine";
 import { chooseMerge, groupParts, partKey, shardParts } from "./parts";
+import type { QueryInput } from "./input";
 import { ReadAhead } from "./readahead";
 
 /// How many times a query runs again because the catalog has moved on before it could commit.
@@ -9,6 +10,8 @@ const MAX_ATTEMPTS = 5;
 const MAX_LOAD_ROUNDS = 16;
 /// The code of the exception of ClickHouse for a write in a read-only query.
 const READONLY = 164;
+/// `ABORTED`: a query whose data streamed has to be sent again.
+const ABORTED = 236;
 
 /// The sizes that decide when a table fans out and which parts merge, in bytes of parts (compressed).
 export interface Limits {
@@ -35,7 +38,8 @@ export const DEFAULT_LIMITS: Limits = {
 /// The query of one shard of a fan-out: the coordinator ran its query against catalog `version`, and the shard reads
 /// `parts` of the table.
 export interface ShardRequest {
-	version: number;
+	/// The definition of the table as the coordinator has it: the shard runs its query on the same one.
+	createQuery: string;
 	database: string;
 	table: string;
 	parts: string[];
@@ -101,42 +105,58 @@ export class Database {
 		return this.engine.memoryBytes;
 	}
 
-	/// A `readonly` query can change nothing: the engine runs it with `readonly` = 1, and its changes are not committed.
+	/// A `readonly` query can change nothing: the engine runs it with `readonly` = 2, and its changes are not committed.
+	/// `input` is the body of the request, which follows `query`.
 	query(
 		query: string | Uint8Array,
 		format: string,
 		io: Io,
 		readonly = false,
 		timings: Timings = { sync: 0, load: 0, commit: 0 },
+		input?: QueryInput,
 	): Promise<QueryResult> {
-		return this.run(query, format, io, readonly, timings);
+		return this.run(query, format, io, readonly, timings, input);
 	}
 
-	/// Runs the query of a shard, at the version of the catalog that the coordinator ran its query against.
+	/// Runs the query of a shard on the parts that the coordinator gave it, with the definition of the table that the
+	/// coordinator has. Parts never change, so the shard does not need the version of the catalog of the coordinator:
+	/// writes to other parts or tables meanwhile do not matter.
 	///
 	/// Durable Objects can share an isolate, and so an engine: a shard can be in the isolate of its coordinator,
-	/// which holds the lock while it waits for its shards. So a shard that is at the version of the request runs
-	/// without the lock: it changes nothing but the loaded parts, and the engine shows it its parts for the duration
-	/// of its query only. A shard at another version syncs, under the lock, and it is never the coordinator then.
+	/// which holds the lock while it waits for its shards. So a shard with the same definition runs without the lock:
+	/// it changes nothing, and the engine shows it its parts for the duration of its query only. A shard with another
+	/// definition syncs, under the lock, and it is never in the isolate of the coordinator then.
 	async shard(request: ShardRequest, io: Io): Promise<ShardAnswer> {
-		const stale = () => ({ ok: false as const, stale: true, message: `The shard is at version ${this.state.version} of the catalog, not ${request.version}` });
-		if (this.state.version !== request.version) {
+		const key = tableKey(request.database, request.table);
+		const same = () => this.state.tables.get(key)?.createQuery === request.createQuery;
+		if (!same()) {
 			await this.exclusive(() => this.sync());
-			if (this.state.version !== request.version) {
-				return stale();
+			if (!same()) {
+				return { ok: false, stale: true, message: `The definition of ${request.database}.${request.table} has changed` };
 			}
 		}
-		const table = this.state.tables.get(tableKey(request.database, request.table));
-		if (table === undefined || request.parts.some((part) => !table.parts.includes(part))) {
-			throw new Error(`The parts of the shard are not in ${request.database}.${request.table}`);
+		const read_ahead = new ReadAhead((part, offset, size) => io.readRange(part, offset, size));
+		const reader = {
+			readRange: (part: string, offset: number, size: number) => read_ahead.readRange(part, offset, size),
+			prefetch: (part: string, offset: number, size: number) => read_ahead.prefetch(part, offset, size),
+			writePart: async (part: string) => {
+				throw new Error(`A shard does not write parts, but it wrote ${part}`);
+			},
+		};
+		let result: QueryResult;
+		try {
+			result = await this.engine.shardQuery(request.query, request.database, request.table, request.parts, reader);
+		} catch (error) {
+			result = { ok: false, code: 0, message: String(error) };
 		}
-		const reader = new ReadAhead((part, offset, size) => io.readRange(part, offset, size));
-		const result = await this.engine.shardQuery(request.query, request.database, request.table, request.parts, reader);
-		/// Other work of the isolate may have synced to another version while this shard ran.
-		if (this.state.version !== request.version) {
-			return stale();
+		if (result.ok) {
+			return { ok: true, data: result.body };
 		}
-		return result.ok ? { ok: true, data: result.body } : { ok: false, stale: false, message: result.message };
+		/// A part that a merge has replaced since the coordinator listed it may be gone: the coordinator runs again. The
+		/// catalog is read without the lock, which the coordinator may hold in this isolate.
+		const parts = (await this.catalog.snapshot()).tables.get(key)?.parts ?? [];
+		const gone = request.parts.some((part) => !parts.includes(part));
+		return { ok: false, stale: gone, message: result.message };
 	}
 
 	/// Runs a merge from the queue. A merge that loses to a concurrent change runs again against the new catalog.
@@ -172,15 +192,15 @@ export class Database {
 
 	/// A query runs in the engine under the lock. If it only adds or replaces parts, which the engine does not show
 	/// until they are committed, the lock is released for the upload and the commit, and other queries run meanwhile.
-	private async run(query: string | Uint8Array, format: string, io: Io, readonly: boolean, timings: Timings): Promise<QueryResult> {
+	private async run(query: string | Uint8Array, format: string, io: Io, readonly: boolean, timings: Timings, input?: QueryInput): Promise<QueryResult> {
 		for (let attempt = 1; ; ++attempt) {
-			const step = await this.exclusive(() => this.prepare(query, format, io, readonly, timings));
+			const step = await this.exclusive(() => this.prepare(query, format, io, readonly, timings, input));
 			if (step.kind === "done") {
 				return step.result;
 			}
 			if (step.kind === "commit") {
 				const start = Date.now();
-				const committed = await this.commitParts(step.snapshot, step.changes, step.uploads, io);
+				const committed = await this.commitParts(step.snapshot, step.changes, step.written, io);
 				timings.commit += Date.now() - start;
 				if (committed) {
 					return step.result;
@@ -193,16 +213,20 @@ export class Database {
 	}
 
 	/// Runs the query against the catalog that the engine is in sync with, and commits the changes to definitions.
-	private async prepare(query: string | Uint8Array, format: string, io: Io, readonly: boolean, timings: Timings): Promise<Step> {
+	private async prepare(query: string | Uint8Array, format: string, io: Io, readonly: boolean, timings: Timings, input?: QueryInput): Promise<Step> {
 		let start = Date.now();
 		await this.sync();
 		timings.sync += Date.now() - start;
-		const result = await this.execute(query, format, readonly, timings, io);
+		/// The parts that the query has put in R2, which go if it does not commit them.
+		const written: string[] = [];
+		const result = await this.execute(query, format, readonly, timings, io, written, input);
 		if (result === "stale") {
+			io.background(this.deleteParts(written));
 			return { kind: "retry" };
 		}
 		if (!result.ok) {
 			await this.discardChanges();
+			io.background(this.deleteParts(written));
 			return { kind: "done", result };
 		}
 		const changes = await this.engine.changes();
@@ -211,20 +235,20 @@ export class Database {
 		}
 		if (readonly) {
 			await this.discardChanges();
+			io.background(this.deleteParts(written));
 			return { kind: "done", result: { ok: false, code: READONLY, message: "A read-only query cannot change the catalog." } };
 		}
 		if (changes.some((change) => change.kind !== "replace_parts")) {
 			start = Date.now();
-			const committed = await this.commit(changes, io);
+			const committed = await this.commit(changes, io, written);
 			timings.commit += Date.now() - start;
 			return committed ? { kind: "done", result } : { kind: "retry" };
 		}
-		const uploads = await this.takeUploads(changes);
 		await this.engine.clearChanges();
 		/// The definitions as the query saw them: an `ALTER` committed meanwhile makes the commit fail.
 		const tables = new Map([...this.state.tables].map(([key, table]) => [key, { ...table, parts: [...table.parts], detached: [...table.detached] }]));
 		const snapshot: Snapshot = { version: this.state.version, databases: new Set(this.state.databases), tables };
-		return { kind: "commit", snapshot, changes, uploads, result };
+		return { kind: "commit", snapshot, changes, written, result };
 	}
 
 	/// Runs the query, which reads the parts that it needs as it goes, and has the shards run their queries for the
@@ -235,6 +259,8 @@ export class Database {
 		readonly: boolean,
 		timings: Timings,
 		io: Io,
+		written: string[],
+		input?: QueryInput,
 	): Promise<QueryResult | "stale"> {
 		/// The time the engine waits for parts, which is less than the time the reads take, as they overlap.
 		const read_ahead = new ReadAhead((part, offset, size) => io.readRange(part, offset, size));
@@ -246,14 +272,28 @@ export class Database {
 				timings.load += Date.now() - start;
 				return data;
 			},
+			/// Each part that the query writes goes to R2 at once, so that the engine holds one at a time.
+			writePart: async (part: string, data: Uint8Array) => {
+				const start = Date.now();
+				written.push(part);
+				await this.parts.put(partKey(part), data);
+				timings.commit += Date.now() - start;
+			},
 		};
 		try {
 			for (let round = 1; ; ++round) {
-				const result = await this.engine.query(query, format, readonly, reader);
+				/// A body that streamed cannot be read again once the engine has read some of it.
+				const body = input?.open();
+				if (input !== undefined && body === undefined) {
+					return { ok: false, code: ABORTED, message: "The catalog changed while the query read its data, which streamed: send the query again." };
+				}
+				const result = await this.engine.query(query, format, readonly, reader, body && { reader: body, encoding: input!.encoding });
 				if (result.ok || result.code !== NOT_FOUND_EXPECTED_DATA_PART || round === MAX_LOAD_ROUNDS) {
 					return result;
 				}
 				await this.discardChanges();
+				/// The query runs again, and writes its parts again.
+				io.background(this.deleteParts(written.splice(0)));
 				const requests = await this.engine.fanOutRequests();
 				if (requests.length === 0) {
 					return result;
@@ -284,7 +324,7 @@ export class Database {
 		const groups = shardParts(table.parts, this.limits.shardBytes, this.limits.maxShards);
 		const answers = await Promise.all(
 			groups.map((parts, index) =>
-				io.runShard(index, { version: this.state.version, database: table.database, table: table.table, parts, query: request.query }),
+				io.runShard(index, { createQuery: table.createQuery, database: table.database, table: table.table, parts, query: request.query }),
 			),
 		);
 		for (const answer of answers) {
@@ -305,19 +345,22 @@ export class Database {
 		await this.engine.setParts(table.database, table.table, group);
 		try {
 			const timings: Timings = { sync: 0, load: 0, commit: 0 };
-			const result = await this.execute(`OPTIMIZE TABLE ${quote(table.database)}.${quote(table.table)} FINAL`, "", false, timings, io);
+			const written: string[] = [];
+			const result = await this.execute(`OPTIMIZE TABLE ${quote(table.database)}.${quote(table.table)} FINAL`, "", false, timings, io, written);
 			if (result === "stale") {
+				io.background(this.deleteParts(written));
 				return "conflict";
 			}
 			if (!result.ok) {
 				await this.discardChanges();
+				io.background(this.deleteParts(written));
 				throw new Error(`Cannot merge the parts of ${table.database}.${table.table}: ${result.message}`);
 			}
 			const changes = await this.engine.changes();
 			if (changes.length === 0) {
 				return "nothing";
 			}
-			return (await this.commit(changes, io)) ? "merged" : "conflict";
+			return (await this.commit(changes, io, written)) ? "merged" : "conflict";
 		} finally {
 			/// After a commit, the table in `state` has its new parts.
 			const current = this.state.tables.get(tableKey(table.database, table.table));
@@ -365,24 +408,22 @@ export class Database {
 		this.state.version = target.version;
 	}
 
-	/// Uploads the new parts and commits the changes, under the lock. Returns false if the catalog has moved on.
-	private async commit(changes: CatalogChange[], io: Io): Promise<boolean> {
-		const uploads = await this.takeUploads(changes);
-		await Promise.all(uploads.map((upload) => this.upload(upload)));
-
+	/// Commits the changes, under the lock, with `written`, the parts that the query has put in R2, which go if it
+	/// does not commit. Returns false if the catalog has moved on.
+	private async commit(changes: CatalogChange[], io: Io, written: string[]): Promise<boolean> {
 		let version: number | undefined;
 		try {
 			version = await this.catalog.commit(this.state, changes);
 		} catch (error) {
 			await this.discardChanges();
 			this.state.version = -1;
-			io.background(this.deleteParts(uploads.map((upload) => upload.name)));
+			io.background(this.deleteParts(written));
 			throw error;
 		}
 		if (version === undefined) {
 			await this.discardChanges();
 			this.state.version = -1;
-			io.background(this.deleteParts(uploads.map((upload) => upload.name)));
+			io.background(this.deleteParts(written));
 			return false;
 		}
 		await this.apply(changes, version, io);
@@ -390,50 +431,22 @@ export class Database {
 		return true;
 	}
 
-	/// Uploads the new parts and commits changes of parts only, without the lock. The engine has given them up, so a
-	/// commit that fails leaves nothing to undo.
-	private async commitParts(snapshot: Snapshot, changes: CatalogChange[], uploads: Upload[], io: Io): Promise<boolean> {
-		await Promise.all(uploads.map((upload) => this.upload(upload)));
+	/// Commits changes of parts only, without the lock. The engine has given them up, so a commit that fails leaves
+	/// nothing to undo but `written`, the parts that the query has put in R2.
+	private async commitParts(snapshot: Snapshot, changes: CatalogChange[], written: string[], io: Io): Promise<boolean> {
 		let version: number | undefined;
 		try {
 			version = await this.catalog.commit(snapshot, changes);
 		} catch (error) {
-			io.background(this.deleteParts(uploads.map((upload) => upload.name)));
+			io.background(this.deleteParts(written));
 			throw error;
 		}
 		if (version === undefined) {
-			io.background(this.deleteParts(uploads.map((upload) => upload.name)));
+			io.background(this.deleteParts(written));
 			return false;
 		}
 		await this.exclusive(() => this.apply(changes, version, io));
 		return true;
-	}
-
-	private async takeUploads(changes: CatalogChange[]): Promise<Upload[]> {
-		const uploads: Upload[] = [];
-		for (const [i, change] of changes.entries()) {
-			if (change.kind === "replace_parts" && change.added !== null) {
-				uploads.push({ name: change.added, data: await this.engine.changeData(i) });
-			}
-			if (change.kind === "replace_parts") {
-				uploads.push(...change.copied.map((copy) => ({ name: copy.to, copyOf: copy.from })));
-			}
-		}
-		return uploads;
-	}
-
-	/// Puts a new part in R2: its data, or a copy of a part of another table, streamed.
-	private async upload(upload: Upload): Promise<void> {
-		if ("data" in upload) {
-			await this.parts.put(partKey(upload.name), upload.data);
-			return;
-		}
-		const source = await this.parts.get(partKey(upload.copyOf));
-		if (source === null) {
-			throw new Error(`Cannot copy part ${upload.copyOf}, which is gone: it was merged meanwhile, try again`);
-		}
-		const { readable, writable } = new FixedLengthStream(source.size);
-		await Promise.all([source.body.pipeTo(writable), this.parts.put(partKey(upload.name), readable)]);
 	}
 
 	/// Applies committed changes to the engine. The engine is at the new version only if no other commit came between:
@@ -526,7 +539,7 @@ export class Database {
 					}
 					const gone = new Set([...change.removed, ...change.detached]);
 					table.parts = table.parts.filter((part) => !gone.has(part));
-					table.parts.push(...change.attached, ...(change.added === null ? [] : [change.added]), ...change.copied.map((copy) => copy.to));
+					table.parts.push(...change.attached, ...(change.added === null ? [] : [change.added]), ...change.shared);
 					const back = new Set([...change.attached, ...change.dropped_detached]);
 					table.detached = [...table.detached.filter((part) => !back.has(part)), ...change.detached];
 					await this.engine.setParts(change.database, change.table, table.parts, table.detached);
@@ -540,7 +553,7 @@ export class Database {
 			this.state.version = version;
 		}
 
-		io.background(this.deleteParts(unused));
+		io.background(this.deleteUnreferenced(unused));
 		for (const key of changed) {
 			const table = this.state.tables.get(key);
 			if (table !== undefined && table.parts.length >= this.limits.mergeThreshold) {
@@ -604,8 +617,21 @@ export class Database {
 		await this.engine.setFanOut(table.database, table.table, table.parts.length > 1 ? this.limits.shardBytes : 0);
 	}
 
-	/// Deletes parts that the catalog no longer has. A query in another isolate may still be about to read one of
-	/// them: it finds it gone, syncs and runs again.
+	/// Deletes parts that a commit took out of a table, unless another table has them: tables share the parts of
+	/// `ATTACH PARTITION ... FROM`, `REPLACE PARTITION ... FROM` and `MOVE PARTITION`. The catalog is read after the
+	/// commit, and a table only gets a part from another table that has it, which the commit checks, so a part that no
+	/// table has then stays so.
+	private async deleteUnreferenced(names: string[]): Promise<void> {
+		if (names.length === 0) {
+			return;
+		}
+		const snapshot = await this.catalog.snapshot();
+		const referenced = new Set([...snapshot.tables.values()].flatMap((table) => [...table.parts, ...table.detached]));
+		await this.deleteParts(names.filter((name) => !referenced.has(name)));
+	}
+
+	/// Deletes parts that no table has. A query in another isolate may still be about to read one of them: it finds it
+	/// gone, syncs and runs again.
 	private async deleteParts(names: string[]): Promise<void> {
 		for (let i = 0; i < names.length; i += 1000) {
 			await this.parts.delete(names.slice(i, i + 1000).map(partKey));
@@ -625,14 +651,11 @@ export class Database {
 	}
 }
 
-/// A new part: its data, or the part of another table that it is a copy of.
-type Upload = { name: string; data: Uint8Array } | { name: string; copyOf: string };
-
 /// What a query that ran in the engine leaves to do.
 type Step =
 	| { kind: "done"; result: QueryResult }
 	| { kind: "retry" }
-	| { kind: "commit"; snapshot: Snapshot; changes: CatalogChange[]; uploads: Upload[]; result: QueryResult };
+	| { kind: "commit"; snapshot: Snapshot; changes: CatalogChange[]; written: string[]; result: QueryResult };
 
 function sameParts(a: readonly string[], b: readonly string[]): boolean {
 	return a.length === b.length && a.every((part, i) => part === b[i]);

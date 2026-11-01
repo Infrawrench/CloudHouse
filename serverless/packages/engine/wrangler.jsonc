@@ -53,5 +53,32 @@
   ],
   "observability": {
     "enabled": true
+  },
+  "env": {
+    // A deployment of its own, `cloudhouse-instances`: its own Workers, Durable Objects, bucket and queue, so it shares
+    // no tables with the one above. `wrangler deploy --env instances`.
+    "instances": {
+      "name": "cloudhouse-instances-core",
+      "workers_dev": false,
+      "durable_objects": {
+        "bindings": [
+          { "name": "COORDINATION", "class_name": "Coordination" },
+          { "name": "ENGINE_HOST", "class_name": "EngineHost" }
+        ]
+      },
+      "queues": {
+        "producers": [{ "binding": "MERGES", "queue": "cloudhouse-instances-merges" }],
+        "consumers": [{ "queue": "cloudhouse-instances-merges", "max_batch_size": 1, "max_retries": 3 }]
+      },
+      "triggers": {
+        "crons": ["17 * * * *"]
+      },
+      "vars": {
+        "ENGINE_POOL": "8"
+      },
+      "r2_buckets": [
+        { "binding": "PARTS", "bucket_name": "cloudhouse-instances-parts" }
+      ]
+    }
   }
 }

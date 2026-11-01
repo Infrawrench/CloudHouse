@@ -1,6 +1,7 @@
 import createClickHouse, { type ClickHouseModule } from "../dist/clickhouse-isolate.mjs";
 import wasm from "../dist/clickhouse-isolate.wasm";
 import { loadData } from "./data";
+import type { InputReader } from "./input";
 
 /// The outcome of a query: its output, or the message of the exception and its code.
 export type QueryResult = { ok: true; body: Uint8Array } | { ok: false; code: number; message: string };
@@ -34,12 +35,13 @@ export type CatalogChange =
 			added: string | null;
 			rows?: number;
 			removed: string[];
-			/// The commands on partitions: parts to detach, detached parts to attach and to delete, and copies of parts of
-			/// other tables, which the host makes before it commits.
+			/// The commands on partitions: parts to detach, and detached parts to attach and to delete.
 			detached: string[];
 			attached: string[];
 			dropped_detached: string[];
-			copied: { from: string; to: string }[];
+			/// Parts of the table `shared_from` that the table gets too.
+			shared: string[];
+			shared_from: [string, string];
 	  };
 
 /// The query for the shards of a table that fans out, from `ch_isolate_fanout_requests`.
@@ -49,11 +51,12 @@ export interface FanOutRequest {
 	query: string;
 }
 
-/// Reads bytes of parts, for the engine while it runs a query: the engine announces the ranges that it is going to
-/// read, then reads them.
-export interface PartReader {
+/// Reads and writes parts, for the engine while it runs a query: the engine announces the ranges that it is going to
+/// read, then reads them, and puts each part that it writes in object storage as soon as it has written it.
+export interface PartIo {
 	readRange(part: string, offset: number, size: number): Promise<Uint8Array>;
 	prefetch(part: string, offset: number, size: number): void;
+	writePart(part: string, data: Uint8Array): Promise<void>;
 }
 
 /// An exception of a call of the engine other than a query.
@@ -75,7 +78,9 @@ const decoder = new TextDecoder();
 export class Engine {
 	private queue: Promise<unknown> = Promise.resolve();
 	/// How the query that runs reads parts.
-	private reader: PartReader | undefined;
+	private reader: PartIo | undefined;
+	/// The body of the request of the query that runs.
+	private input: InputReader | undefined;
 
 	private constructor(private readonly module: ClickHouseModule) {}
 
@@ -100,6 +105,15 @@ export class Engine {
 				prefetch(part, offset, size) {
 					engine!.currentReader(part).prefetch(part, offset, size);
 				},
+				writePart(part, data) {
+					return engine!.currentReader(part).writePart(part, data);
+				},
+				readInput(size) {
+					if (engine!.input === undefined) {
+						throw new Error("The engine reads the body of a query that has none");
+					}
+					return engine!.input.read(size);
+				},
 			},
 		});
 		engine = new Engine(module);
@@ -107,17 +121,28 @@ export class Engine {
 		return engine;
 	}
 
-	/// Runs `query`, whose text may be followed by the data of an `INSERT`. `format` is the output format of a
-	/// query without a `FORMAT` clause, by default `TabSeparated`. A `readonly` query runs with the setting
-	/// `readonly` = 1: it can neither write nor change settings. The query reads parts with `reader`.
-	query(query: string | Uint8Array, format: string, readonly: boolean, reader: PartReader): Promise<QueryResult> {
+	/// Runs `query`, whose text may be followed by the data of an `INSERT`, then by `input`, the body of the request
+	/// compressed with `encoding`. `format` is the output format of a query without a `FORMAT` clause, by default
+	/// `TabSeparated`. A `readonly` query runs with the setting `readonly` = 2: it can change settings but not write.
+	/// The query reads and writes parts with `reader`.
+	query(
+		query: string | Uint8Array,
+		format: string,
+		readonly: boolean,
+		reader: PartIo,
+		input?: { reader: InputReader; encoding: string },
+	): Promise<QueryResult> {
 		return this.exclusive(async () => {
+			this.input = input?.reader;
 			const code = await this.callAsync(
-				(q, f) => this.module._ch_isolate_query(q[0], q[1], f[0], f[1], readonly ? 1 : 0),
+				(q, f, e) => this.module._ch_isolate_query(q[0], q[1], f[0], f[1], readonly ? 1 : 0, input ? 1 : 0, e[0], e[1]),
 				reader,
 				query,
 				format,
-			);
+				input?.encoding ?? "",
+			).finally(() => {
+				this.input = undefined;
+			});
 			const body = this.takeResult();
 			return code === 0 ? { ok: true, body } : { ok: false, code, message: decoder.decode(body) };
 		});
@@ -125,7 +150,7 @@ export class Engine {
 
 	/// Runs the query of a shard up to `WithMergeableState` on `parts` of the table, and returns its blocks. The other
 	/// queries keep seeing all the visible parts of the table.
-	shardQuery(query: string, database: string, table: string, parts: readonly string[], reader: PartReader): Promise<QueryResult> {
+	shardQuery(query: string, database: string, table: string, parts: readonly string[], reader: PartIo): Promise<QueryResult> {
 		const spec = [database, table, ...parts].join("\n") + "\n";
 		return this.exclusive(async () => {
 			const code = await this.callAsync((q, s) => this.module._ch_isolate_shard_query(q[0], q[1], s[0], s[1]), reader, query, spec);
@@ -150,14 +175,6 @@ export class Engine {
 		return this.exclusive(async () => {
 			this.check(this.module._ch_isolate_changes());
 			return lines(decoder.decode(this.takeResult())).map((line) => JSON.parse(line) as CatalogChange);
-		});
-	}
-
-	/// The data of the part that change `index` adds.
-	changeData(index: number): Promise<Uint8Array> {
-		return this.exclusive(async () => {
-			this.check(this.module._ch_isolate_change_data(BigInt(index)));
-			return this.takeResult();
 		});
 	}
 
@@ -227,7 +244,7 @@ export class Engine {
 		}
 	}
 
-	private currentReader(part: string): PartReader {
+	private currentReader(part: string): PartIo {
 		if (this.reader === undefined) {
 			throw new Error(`The engine reads part ${part} outside of a query`);
 		}
@@ -235,7 +252,7 @@ export class Engine {
 	}
 
 	/// As `call`, for a function that may suspend, with `reader` as the reader of parts meanwhile.
-	private async callAsync(f: (...args: [bigint, bigint][]) => Promise<number>, reader: PartReader, ...args: (string | Uint8Array)[]): Promise<number> {
+	private async callAsync(f: (...args: [bigint, bigint][]) => Promise<number>, reader: PartIo, ...args: (string | Uint8Array)[]): Promise<number> {
 		const pointers: number[] = [];
 		this.reader = reader;
 		try {

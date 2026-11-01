@@ -3,7 +3,11 @@ import { Catalog } from "./catalog";
 import { DEFAULT_LIMITS, Database, type Io, type Limits, type MergeMessage, type ShardRequest, type Timings } from "./database";
 import { Engine } from "./engine";
 import type { Env } from "./env";
-import type { Answer } from "./http";
+import type { Answer, QueryRequest } from "./http";
+import { bufferedInput, MAX_QUERY_BODY, type QueryInput, readAll, streamedInput } from "./input";
+
+/// `BAD_ARGUMENTS`.
+const BAD_ARGUMENTS = 36;
 import type { ShardAnswer } from "./database";
 
 /// The engine of this isolate. It is created by the first query rather than at the top level, because the global
@@ -53,7 +57,7 @@ export function limits(env: Env): Limits {
 
 /// The ranges of parts that this isolate has read, the most recently used last: a part never changes, so the blocks
 /// that queries read often are read once. At most `RANGE_CACHE_BYTES`, compressed, beside the memory of the engine.
-const RANGE_CACHE_BYTES = 16 * 1024 * 1024;
+const RANGE_CACHE_BYTES = 4 * 1024 * 1024;
 const range_cache = new Map<string, Uint8Array>();
 let range_cache_bytes = 0;
 
@@ -115,13 +119,27 @@ export function makeIo(env: Env, background: (promise: Promise<unknown>) => void
 /// Runs a query in the engine of this isolate. `timing` is for `Server-Timing`: only I/O moves the clock of a
 /// Worker, so `startup` is the read of the static data by a new engine, and the rest are waits on the catalog, on
 /// parts and shards, and on commits.
-export async function runQuery(env: Env, io: Io, text: Uint8Array, format: string, readonly: boolean): Promise<Answer> {
+export async function runQuery(env: Env, io: Io, request: QueryRequest): Promise<Answer> {
 	const cold = database === undefined;
 	const start = Date.now();
 	const db = await getDatabase(env);
 	const startup = Date.now() - start;
 	const timings: Timings = { sync: 0, load: 0, commit: 0 };
-	const result = await db.query(text, format, io, readonly, timings);
+	/// With a `query` parameter, the body is the data that follows it and streams; without, the body is the query.
+	let text = "";
+	let input: QueryInput | undefined;
+	if (request.query !== null) {
+		text = request.body === null ? request.query : `${request.query}\n`;
+		input = request.body === null ? undefined : streamedInput(request.body, request.encoding);
+	} else if (request.body !== null) {
+		const body = await readAll(request.body, MAX_QUERY_BODY);
+		if (body === undefined) {
+			const message = `A query in the body is at most ${MAX_QUERY_BODY} bytes: send the query in the \`query\` parameter, and its data in the body.`;
+			return { ok: false, code: BAD_ARGUMENTS, message, timing: "" };
+		}
+		input = bufferedInput(body, request.encoding);
+	}
+	const result = await db.query(text, request.format, io, request.readonly, timings, input);
 	const timing = [
 		...(cold ? [`startup;dur=${startup}`] : []),
 		`sync;dur=${timings.sync}`,

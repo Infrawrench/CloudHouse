@@ -1,11 +1,13 @@
 #include "ObjectPart.h"
 
+#include <Columns/ColumnConst.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
 #include <Compression/CompressedReadBuffer.h>
 #include <Compression/CompressedWriteBuffer.h>
 #include <Compression/CompressionFactory.h>
 #include <Core/ProtocolDefines.h>
+#include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/IDataType.h>
@@ -34,6 +36,8 @@
 /// how many there were. The engine waits for them: with JSPI the import suspends the engine and resumes it when the
 /// host has read them.
 extern "C" size_t ch_host_read_range(const char * part, size_t part_size, size_t offset, size_t size, char * dest);
+/// Imported from the host: puts a part that the engine wrote in object storage, and returns once it is there.
+extern "C" void ch_host_write_part(const char * part, size_t part_size, const char * data, size_t size);
 /// Imported from the host: the engine is going to read the bytes `[offset, offset + size)` of a part, so the host can
 /// start reading them, and read several ranges at once. It does not wait.
 extern "C" void ch_host_prefetch(const char * part, size_t part_size, size_t offset, size_t size);
@@ -63,6 +67,7 @@ constexpr size_t index_cache_size = 4096;
 const String min_prefix = "_min.";
 const String max_prefix = "_max.";
 const String skip_prefix = "_skip.";
+const String partition_column = "_partition";
 
 ObjectPartIndexPtr parseIndex(std::string_view data, UInt64 index_revision)
 {
@@ -93,6 +98,8 @@ ObjectPartIndexPtr parseIndex(std::string_view data, UInt64 index_revision)
             entry.ranges.emplace_back((*mins[c])[i], true, (*maxs[c])[i], true);
         index->blocks.push_back(std::move(entry));
     }
+    if (block.has(partition_column) && block.rows() > 0)
+        index->partition = block.getByName(partition_column).column->getDataAt(0);
     for (const auto & column : block)
     {
         if (!column.name.starts_with(skip_prefix))
@@ -164,6 +171,7 @@ struct ObjectPartWriter::State
     MutableColumns mins;
     MutableColumns maxs;
     MutableColumns skip_granules;
+    String partition;
 
     State(const Block & header_, NamesAndTypesList minmax_columns_, ObjectPartSkipIndices skip_indices_)
         : header(header_.cloneEmpty())
@@ -192,6 +200,11 @@ ObjectPartWriter::ObjectPartWriter(const Block & header, NamesAndTypesList minma
 }
 
 ObjectPartWriter::~ObjectPartWriter() = default;
+
+void ObjectPartWriter::setPartition(String partition)
+{
+    state->partition = std::move(partition);
+}
 
 void ObjectPartWriter::write(const Block & block)
 {
@@ -275,6 +288,8 @@ String ObjectPartWriter::finish()
     }
     for (size_t j = 0; j < s.skip_indices.size(); ++j)
         index.insert({std::move(s.skip_granules[j]), std::make_shared<DataTypeString>(), skip_prefix + s.skip_indices[j].name});
+    const auto string = std::make_shared<DataTypeString>();
+    index.insert({string->createColumnConst(index.rows(), s.partition)->convertToFullColumnIfConst(), string, partition_column});
 
     const UInt64 index_offset = s.out.count();
     NativeWriter index_writer(s.out, revision, std::make_shared<const Block>(index.cloneEmpty()));
@@ -299,6 +314,11 @@ String readPartRange(const String & part, UInt64 offset, UInt64 size)
     return data;
 }
 
+void writePart(const String & part, const String & data)
+{
+    ch_host_write_part(part.data(), part.size(), data.data(), data.size());
+}
+
 void prefetchPartRange(const String & part, UInt64 offset, UInt64 size)
 {
     ch_host_prefetch(part.data(), part.size(), offset, size);
@@ -312,12 +332,15 @@ void prefetchPartIndex(const String & part, UInt64 bytes)
 
 void prefetchPartBlocks(const String & part, const ObjectPartIndex & index, const std::vector<size_t> & blocks)
 {
-    /// The runs of consecutive blocks, each in one read.
+    /// The runs of consecutive blocks, each in one read of at most `max_prefetch_bytes`, which the host holds until the
+    /// engine has read all of it: it shares the memory of the isolate with the engine.
+    constexpr UInt64 max_prefetch_bytes = 2 * 1024 * 1024;
     for (size_t i = 0; i < blocks.size();)
     {
         size_t j = i + 1;
-        while (j < blocks.size() && blocks[j] == blocks[j - 1] + 1)
-            ++j;
+        UInt64 bytes = index.blocks[blocks[i]].size;
+        while (j < blocks.size() && blocks[j] == blocks[j - 1] + 1 && bytes + index.blocks[blocks[j]].size <= max_prefetch_bytes)
+            bytes += index.blocks[blocks[j++]].size;
         const auto & first = index.blocks[blocks[i]];
         const auto & last = index.blocks[blocks[j - 1]];
         prefetchPartRange(part, first.offset, last.offset + last.size - first.offset);
@@ -435,6 +458,43 @@ Block readPartBlock(
 }
 
 
+VirtualColumnsDescription objectPartVirtuals()
+{
+    VirtualColumnsDescription virtuals;
+    auto name = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+    virtuals.addEphemeral("_part", name, "The name of the part.", VirtualsMaterializationPlace::Reader);
+    virtuals.addEphemeral("_partition_id", name, "The id of the partition of the part.", VirtualsMaterializationPlace::Reader);
+    return virtuals;
+}
+
+namespace
+{
+
+/// The name of a part is `<uuid>_<rows>_<bytes>_<partition id>` (`ObjectPartName`), and the id may contain `_`.
+String partitionIdOfPart(const String & part)
+{
+    size_t position = 0;
+    for (size_t i = 0; i < 3; ++i)
+        position = part.find('_', position) + 1;
+    return part.substr(position);
+}
+
+bool isPartVirtual(const String & name)
+{
+    return name == "_part" || name == "_partition_id";
+}
+
+NamesAndTypesList withoutVirtuals(const NamesAndTypesList & columns)
+{
+    NamesAndTypesList result;
+    for (const auto & column : columns)
+        if (!isPartVirtual(column.name))
+            result.push_back(column);
+    return result;
+}
+
+}
+
 ObjectPartSource::ObjectPartSource(
     SharedHeader header,
     String part_,
@@ -448,7 +508,8 @@ ObjectPartSource::ObjectPartSource(
     , index(std::move(index_))
     , blocks(std::move(blocks_))
     , columns(std::move(columns_))
-    , physical_columns(physicalColumns(columns))
+    , partition_id(partitionIdOfPart(part))
+    , physical_columns(physicalColumns(withoutVirtuals(columns)))
     , table_columns(std::make_shared<const ColumnsDescription>(table_columns_))
     , context(std::move(context_))
 {
@@ -462,12 +523,19 @@ Chunk ObjectPartSource::generate()
     if (columns.empty())
         return Chunk(Columns{}, index->blocks[block_index].rows);
 
-    Block block = readPartBlock(part, *index, block_index, physical_columns, *table_columns, context);
+    const size_t rows = index->blocks[block_index].rows;
+    Block block = physical_columns.empty() ? Block{} : readPartBlock(part, *index, block_index, physical_columns, *table_columns, context);
     Columns result;
     result.reserve(columns.size());
     for (const auto & column : columns)
-        result.push_back(getColumnFromBlock(block, column));
-    const size_t rows = block.rows();
+    {
+        if (column.name == "_part")
+            result.push_back(column.type->createColumnConst(rows, part)->convertToFullColumnIfConst());
+        else if (column.name == "_partition_id")
+            result.push_back(column.type->createColumnConst(rows, partition_id)->convertToFullColumnIfConst());
+        else
+            result.push_back(getColumnFromBlock(block, column));
+    }
     return Chunk(std::move(result), rows);
 }
 

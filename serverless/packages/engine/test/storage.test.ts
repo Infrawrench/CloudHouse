@@ -10,7 +10,7 @@ const decoder = new TextDecoder();
 
 /// Isolates of one cluster: each has an engine of its own, and they share the catalog and the bucket. The shards of
 /// a fan-out from isolate `i` are the isolates from `i` on, and merges are collected for the test to run.
-async function cluster(isolates: number, limits: Partial<Limits> = {}) {
+async function cluster(isolates: number, limits: Partial<Limits> = {}, hooks: { beforeShard?: () => Promise<void> } = {}) {
 	const data = await (await env.ASSETS.fetch("https://assets.local/clickhouse-isolate.data")).arrayBuffer();
 	const id = env.COORDINATION.newUniqueId();
 	const background: Promise<unknown>[] = [];
@@ -35,8 +35,9 @@ async function cluster(isolates: number, limits: Partial<Limits> = {}) {
 			return new Uint8Array(await object.arrayBuffer());
 		},
 		/// Shard 0 is the coordinator itself, as when two Durable Objects share an isolate.
-		runShard(index, request) {
+		async runShard(index, request) {
 			shards.count += 1;
+			await hooks.beforeShard?.();
 			const shard = (self + index) % databases.length;
 			return databases[shard]!.shard(request, io(shard));
 		},
@@ -141,6 +142,9 @@ describe("ObjectMergeTree", () => {
 		/// A query whose filter keeps no blocks reads them here.
 		shards.count = 0;
 		expect(await run(a!, "SELECT count() FROM t WHERE k = 7")).toBe("0\n");
+		expect(shards.count).toBe(0);
+		/// Neither does a query of rows, which the shards would not reduce.
+		expect(await run(a!, "SELECT sum(length(s)) FROM (SELECT s FROM t WHERE k = 1)")).toBe("2978\n");
 		expect(shards.count).toBe(0);
 	});
 
@@ -265,20 +269,75 @@ describe("ObjectMergeTree", () => {
 
 		await run(a!, "ALTER TABLE q ATTACH PARTITION 202610 FROM p");
 		expect(await run(b!, "SELECT count(), min(d) FROM q")).toBe("30\t2026-10-01\n");
+		/// A table has a part once.
+		expect(await fail(a!, "ALTER TABLE q ATTACH PARTITION 202610 FROM p")).toContain("has part");
 		await run(a!, "ALTER TABLE q REPLACE PARTITION 202609 FROM p");
 		expect(await run(b!, "SELECT count() FROM q")).toBe("60\n");
-		/// The parts of `q` are copies: dropping `p` leaves them.
-		await run(b!, "ALTER TABLE p MOVE PARTITION 202610 TO TABLE q");
+		/// `q` shares the parts of `p`: they stay when `p` gives them up.
+		await run(a!, "CREATE TABLE m (d Date, v UInt64) PARTITION BY toYYYYMM(d) ORDER BY d");
+		await run(b!, "ALTER TABLE p MOVE PARTITION 202610 TO TABLE m");
 		expect(await run(a!, "SELECT count() FROM p")).toBe("30\n");
-		expect(await run(a!, "SELECT count() FROM q")).toBe("90\n");
+		expect(await run(a!, "SELECT count() FROM m")).toBe("30\n");
 		await run(a!, "DROP TABLE p");
-		expect(await run(b!, "SELECT count() FROM q")).toBe("90\n");
+		await run(a!, "DROP TABLE m");
+		expect(await run(b!, "SELECT count(), sum(v) FROM q")).toBe("60\t1770\n");
 
 		const part = (await run(a!, "SELECT name FROM system.parts WHERE table = 'q' ORDER BY name LIMIT 1")).trim();
 		await run(b!, `ALTER TABLE q DETACH PART '${part}'`);
 		expect(await fail(a!, `ALTER TABLE q DROP DETACHED PART '${part}'`)).toContain("allow_drop_detached");
 		await run(a!, `ALTER TABLE q DROP DETACHED PART '${part}' SETTINGS allow_drop_detached = 1`);
 		expect(await run(b!, "SELECT count() FROM system.detached_parts")).toBe("0\n");
+	});
+
+	it("swaps a large partition in one commit, sharing its parts", async () => {
+		const { databases: [a, b], run } = await cluster(2);
+		const objects = async () => (await env.PARTS.list({ prefix: "parts/" })).objects.length;
+		await run(a!, "CREATE TABLE sz_a (source LowCardinality(String), a String, g Map(String, String), h Bool) PARTITION BY source ORDER BY a");
+		await run(a!, "CREATE TABLE sz_b AS sz_a");
+		for (let i = 0; i < 6; ++i) {
+			await run(b!, `INSERT INTO sz_b SELECT 'big', toString(number), map('k', toString(number % 5)), number % 2 = 0 FROM numbers(${i * 50000}, 50000)`);
+		}
+		await run(a!, "INSERT INTO sz_a VALUES ('big', 'old', {}, false), ('small', 'x', {}, true)");
+		const before = await objects();
+		await run(a!, "ALTER TABLE sz_a REPLACE PARTITION 'big' FROM sz_b");
+		/// No part was copied: the old part of `big` goes, once nothing has it.
+		expect(await objects()).toBeLessThanOrEqual(before);
+		expect(await run(b!, "SELECT source, count() FROM sz_a GROUP BY source ORDER BY source")).toBe("big\t300000\nsmall\t1\n");
+		/// The source may change and go: the destination keeps the parts.
+		await run(b!, "OPTIMIZE TABLE sz_b FINAL");
+		await run(b!, "DROP TABLE sz_b");
+		expect(await run(a!, "SELECT count(), countIf(h) FROM sz_a WHERE source = 'big'")).toBe("300000\t150000\n");
+		expect(await run(a!, "SELECT count() FROM system.parts WHERE table = 'sz_a'")).not.toBe("0\n");
+	});
+
+	it("reads while other partitions and tables change", async () => {
+		let writes = 0;
+		const writer = { run: undefined as undefined | (() => Promise<void>) };
+		const { databases: [a, b], run } = await cluster(2, { shardBytes: 1, maxShards: 2 }, { beforeShard: () => writer.run?.() ?? Promise.resolve() });
+		await run(a!, "CREATE TABLE r (p UInt8, v UInt64) PARTITION BY p ORDER BY v");
+		await run(a!, "CREATE TABLE other (v UInt64) ORDER BY v");
+		await run(a!, "INSERT INTO r SELECT 1, number FROM numbers(1000)");
+		await run(a!, "INSERT INTO r SELECT 2, number FROM numbers(1000)");
+		/// Before every shard runs, another isolate commits: the shards see a newer catalog than the coordinator.
+		writer.run = async () => {
+			writes += 1;
+			await run(b!, `INSERT INTO other VALUES (${writes})`);
+			await run(b!, `INSERT INTO r VALUES (3, ${writes})`);
+		};
+		expect(await run(a!, "SELECT count(), sum(v) FROM r WHERE p != 3")).toBe("2000\t999000\n");
+		expect(writes).toBeGreaterThan(0);
+	});
+
+	it("has the virtual columns and the partitions of parts", async () => {
+		const { databases: [a], run } = await cluster(1);
+		await run(a!, "CREATE TABLE vp (k UInt32, s String) PARTITION BY k % 3 ORDER BY k");
+		await run(a!, "INSERT INTO vp SELECT number, toString(number) FROM numbers(9)");
+		expect(await run(a!, "SELECT _partition_id, count() FROM vp GROUP BY _partition_id ORDER BY _partition_id")).toBe("0\t3\n1\t3\n2\t3\n");
+		expect(await run(a!, "SELECT count(DISTINCT _part) FROM vp")).toBe("3\n");
+		expect(await run(a!, "SELECT groupArray(partition) FROM (SELECT partition FROM system.parts WHERE table = 'vp' ORDER BY partition)")).toBe(
+			"['0','1','2']\n",
+		);
+		expect(await run(a!, "SELECT name = _part FROM vp, system.parts WHERE k = 4 AND table = 'vp' AND partition_id = '1'")).toBe("1\n");
 	});
 
 	it("applies the TTL in merges", async () => {
@@ -398,6 +457,21 @@ describe("ObjectMergeTree", () => {
 		/// so the check is only about the orphan.
 		await collectGarbage(env, Date.now() + 2 * 60 * 60 * 1000);
 		expect(await env.PARTS.head("parts/orphan")).toBeNull();
+	});
+
+	it("writes parts during the query, and deletes them if it fails", async () => {
+		const { databases: [a], run, fail, settle } = await cluster(1);
+		await run(a!, "CREATE TABLE w (id UInt64, CONSTRAINT small CHECK id < 50) ORDER BY id");
+		const objects = async () => (await env.PARTS.list({ prefix: "parts/" })).objects.length;
+		const before = await objects();
+		/// Blocks of 10 rows: the first five become parts before the sixth breaks the constraint.
+		const settings = "SETTINGS max_block_size = 10, min_insert_block_size_rows = 10, max_insert_block_size = 10";
+		expect(await fail(a!, `INSERT INTO w SELECT number FROM numbers(100) ${settings}`)).toContain("VIOLATED_CONSTRAINT");
+		await settle();
+		expect(await objects()).toBe(before);
+		await run(a!, `INSERT INTO w SELECT number FROM numbers(40) ${settings}`);
+		expect(await objects()).toBe(before + 4);
+		expect(await run(a!, "SELECT count(), sum(id) FROM w")).toBe("40\t780\n");
 	});
 
 	it("keeps the catalog when a query fails", async () => {

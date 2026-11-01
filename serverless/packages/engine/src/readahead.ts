@@ -7,7 +7,8 @@ export class ReadAhead {
 
 	constructor(
 		private readonly read: (part: string, offset: number, size: number) => Promise<Uint8Array>,
-		private readonly max_bytes = 16 * 1024 * 1024,
+		/// The ranges share the 128 MB of the isolate with the engine, which may have 100 MiB.
+		private readonly max_bytes = 6 * 1024 * 1024,
 	) {}
 
 	prefetch(part: string, offset: number, size: number): void {

@@ -23,7 +23,8 @@ class KeyCondition;
 ///     the blocks: each in the `Native` format of `revision`, compressed on its own, at most `rows_per_block` rows
 ///     the index: one `Native` block, not compressed, with a row per block: `_offset`, `_size` and `_rows`, then the
 ///         minimum and the maximum of each column of the min-max index, `_min.<column>` and `_max.<column>`, then the
-///         granule of each data skipping index of the table, `_skip.<index>`
+///         granule of each data skipping index of the table, `_skip.<index>`, and the value of the partition of the
+///         part, as `system.parts` shows it, `_partition`
 ///     UInt64 offset of the index, UInt64 size of the index, "CHPART02"
 ///
 /// A query reads the index, then the blocks that its filter may need, with range reads: the engine asks the host for
@@ -66,6 +67,8 @@ struct ObjectPartIndex
     std::vector<Entry> blocks;
     /// The granules of the data skipping indexes, by the name of the index: one per block.
     std::unordered_map<String, Strings> skip_granules;
+    /// The value of the partition, as `system.parts` shows it. Empty in the parts written before it was kept.
+    String partition;
 
     UInt64 rows() const;
 };
@@ -83,6 +86,8 @@ public:
     ~ObjectPartWriter();
 
     void write(const Block & block);
+    /// The value of the partition of the part, for `system.parts`.
+    void setPartition(String partition);
     /// Returns the part.
     String finish();
 
@@ -99,6 +104,9 @@ private:
 
 /// Reads the bytes `[offset, offset + size)` of a part from the host, waiting for them.
 String readPartRange(const String & part, UInt64 offset, UInt64 size);
+
+/// Gives a part that a query wrote to the host, which puts it in object storage before it returns.
+void writePart(const String & part, const String & data);
 
 /// The index of a part of `bytes` bytes, read from the host, or from a cache of the indexes that the isolate read.
 ObjectPartIndexPtr readPartIndex(const String & part, UInt64 bytes);
@@ -120,7 +128,12 @@ Block readPartBlock(
     const ColumnsDescription & table_columns,
     const ContextPtr & context);
 
-/// Streams the chosen blocks of a part, with the columns `columns` (which may include subcolumns) of the table.
+/// The virtual columns of the tables of `ObjectMergeTree`, which a source fills for each part: `_part`, its name, and
+/// `_partition_id`.
+VirtualColumnsDescription objectPartVirtuals();
+
+/// Streams the chosen blocks of a part, with the columns `columns` (which may include subcolumns and the virtual
+/// columns) of the table.
 class ObjectPartSource final : public ISource
 {
 public:
@@ -144,6 +157,7 @@ private:
     std::vector<size_t> blocks;
     size_t next = 0;
     NamesAndTypesList columns;
+    String partition_id;
     /// The physical columns that `columns` are read from.
     NamesAndTypesList physical_columns;
     std::shared_ptr<const ColumnsDescription> table_columns;

@@ -16,5 +16,21 @@
   },
   "observability": {
     "enabled": true
+  },
+  "env": {
+    // The deployment `cloudhouse-instances`, see `packages/engine/wrangler.jsonc`.
+    "instances": {
+      "name": "cloudhouse-instances",
+      "workers_dev": false,
+      "routes": [{ "pattern": "instances-clickhouse.infrawrench.com", "custom_domain": true }],
+      "durable_objects": {
+        "bindings": [
+          { "name": "ENGINES", "class_name": "EngineHost", "script_name": "cloudhouse-instances-core" }
+        ]
+      },
+      "vars": {
+        "ENGINE_POOL": "8"
+      }
+    }
   }
 }

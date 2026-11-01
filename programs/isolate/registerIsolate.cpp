@@ -28,7 +28,7 @@
     M(Nested) M(Replicate) M(FirstNonDefault) M(DefaultValueOfTypeName) M(ValidateNestedArraySizes) M(IsNotDistinctFrom) \
     M(IsDistinctFrom) M(IsZeroOrNull) M(NotHas) M(MapMiscellaneous) M(TupleConcat) \
     /* Arithmetic and comparison. */ \
-    M(Plus) M(Minus) M(Multiply) M(Divide) M(DivideDecimals) M(MultiplyDecimals) M(IntDiv) M(IntDivOrZero) M(Modulo) \
+    M(Plus) M(Minus) M(Multiply) M(Divide) M(DivideDecimals) M(MultiplyDecimals) M(IntDiv) M(IntDivOrZero) M(Modulo) M(ModuloLegacy) M(PositiveModulo) \
     M(Negate) M(Abs) M(Least) M(Greatest) \
     M(Equals) M(NotEquals) M(Less) M(Greater) M(LessOrEquals) M(GreaterOrEquals) \
     /* Conditions and NULLs. */ \

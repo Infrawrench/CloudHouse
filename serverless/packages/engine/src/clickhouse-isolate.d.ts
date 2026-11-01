@@ -9,11 +9,19 @@ declare module "*/clickhouse-isolate.mjs" {
 		_free(ptr: number): void;
 		_ch_isolate_init(): number;
 		/// JSPI: the functions that run queries suspend while the host reads parts, and return promises.
-		_ch_isolate_query(query: bigint, query_size: bigint, format: bigint, format_size: bigint, readonly: number): Promise<number>;
+		_ch_isolate_query(
+			query: bigint,
+			query_size: bigint,
+			format: bigint,
+			format_size: bigint,
+			readonly: number,
+			with_input: number,
+			encoding: bigint,
+			encoding_size: bigint,
+		): Promise<number>;
 		_ch_isolate_host_query(query: bigint, query_size: bigint): number;
 		_ch_isolate_set_parts(spec: bigint, spec_size: bigint): number;
 		_ch_isolate_changes(): number;
-		_ch_isolate_change_data(index: bigint): number;
 		_ch_isolate_clear_changes(): number;
 		_ch_isolate_set_fanout(spec: bigint, spec_size: bigint): number;
 		_ch_isolate_fanout_requests(): number;
@@ -35,6 +43,8 @@ declare module "*/clickhouse-isolate.mjs" {
 		host: {
 			readRange(part: string, offset: number, size: number): Promise<Uint8Array>;
 			prefetch(part: string, offset: number, size: number): void;
+			writePart(part: string, data: Uint8Array): Promise<void>;
+			readInput(size: number): Promise<Uint8Array>;
 		};
 	}
 
