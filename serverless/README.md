@@ -279,6 +279,14 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
   out fails the query and releases the lock. Before, a shard that never answered left its coordinator holding the
   lock for good: the engine answered nothing, not even `SELECT 1`, and the alarms of `KEEP_WARM_SECONDS` kept its
   object from being reset. A commit to the catalog that runs out says that it may still be applied.
+- **Stuck engines.** The deadlines did not cover everything: on 2026-11-02, two engines of the pool waited from
+  18:42 on something without one, with no CPU, and answered nothing. So an engine whose lock has been held for 5
+  minutes (`STUCK_MS` in `src/host.ts`) is given up, and the next work of the isolate starts a new one; an object
+  whose query or shard call has run for 5 minutes resets itself (`ctx.abort`). Each object checks at its alarm and on
+  each call, and logs what the lock holder was doing and which waits with a deadline were open: none means that the
+  wait has no deadline. `EngineHost.busy` says the same. The gateway passes over an engine that has been busy for more
+  than 30 s, or does not say how busy it is in 250 ms, as it does one that came back cold: a stuck engine never comes
+  back at all, and the gateway kept choosing the stuck engines while it passed over those that Cloudflare replaced.
 - **Garbage.** An hourly Cron Trigger (`src/garbage.ts`) deletes the parts in R2 that no table has and that are
   older than an hour: the parts of a commit that failed and were not deleted then. A bucket belongs to one catalog.
 

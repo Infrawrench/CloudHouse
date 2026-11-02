@@ -32,8 +32,18 @@ export function recentlyCold(cold_at: ReadonlyMap<number, number>, index: number
 	return now - (cold_at.get(index) ?? -Infinity) < COLD_FOR_MS;
 }
 
-/// When each engine of the pool last answered with a new engine, in this isolate.
+/// When each engine of the pool last answered with a new engine, or seemed stalled (`stalled`), in this isolate.
 const engine_cold_at = new Map<number, number>();
+
+/// An engine whose lock has been held this long runs a long query, or is stuck (`EngineHost.resetIfStuck`).
+const STALLED_MS = 30_000;
+
+/// Whether a query sent to the engine would wait long: it is starting or running something long, or it did not say.
+/// An engine that is stuck never comes back cold, so the gateway passes it over for this instead: otherwise the
+/// engines that Cloudflare replaces would be passed over, and the stuck ones would be left to choose from.
+export function stalled(load: EngineLoad | undefined): boolean {
+	return load === undefined || load.running_ms > STALLED_MS;
+}
 
 /// How long the gateway waits for an engine to say how busy it is. An engine that does not answer in time is taken to
 /// be busy: its isolate is computing, or stuck.
@@ -95,9 +105,23 @@ export async function askPool(
 	if (session !== null) {
 		index = hash(session) % pool;
 	} else {
-		const candidates = pickTwo(choices);
-		const loads = await Promise.all(candidates.map((candidate) => loadOf(engineHost(hosts, `engine-${candidate}`, location_hint))));
-		index = leastBusy(candidates, loads);
+		/// If both engines are stalled, two others, if there are: the query goes to the less busy of all that answered.
+		const asked: number[] = [];
+		const loads: (EngineLoad | undefined)[] = [];
+		for (let round = 0; round < 2; ++round) {
+			const candidates = pickTwo(choices.filter((choice) => !asked.includes(choice)));
+			if (candidates.length === 0) {
+				break;
+			}
+			const answers = await Promise.all(candidates.map((candidate) => loadOf(engineHost(hosts, `engine-${candidate}`, location_hint))));
+			asked.push(...candidates);
+			loads.push(...answers);
+			candidates.forEach((candidate, i) => stalled(answers[i]) && engine_cold_at.set(candidate, Date.now()));
+			if (!answers.every(stalled)) {
+				break;
+			}
+		}
+		index = leastBusy(asked, loads);
 	}
 	const host = engineHost(hosts, `engine-${index}`, location_hint);
 	let answer: Answer;

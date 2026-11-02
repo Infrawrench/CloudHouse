@@ -107,8 +107,9 @@ export class Database {
 	private state: Snapshot = { version: -1, databases: new Set(), tables: new Map() };
 	/// The work runs one piece at a time: the engine is shared by the requests of the isolate.
 	private queue: Promise<unknown> = Promise.resolve();
-	/// When the work that holds the lock took it, and how many wait for it, for `busy`.
+	/// When the work that holds the lock took it, what it is, and how many wait for it, for `busy`.
 	private held_since: number | undefined;
+	private held_by: string | undefined;
 	private waiting = 0;
 	/// Why the last query ran again, if it was for an error of the engine, which a query that runs again too many
 	/// times returns.
@@ -152,7 +153,7 @@ export class Database {
 		const key = tableKey(request.database, request.table);
 		const same = () => this.state.tables.get(key)?.createQuery === request.createQuery;
 		if (!same()) {
-			await this.exclusive(() => this.sync());
+			await this.exclusive("shard sync", () => this.sync());
 			if (!same()) {
 				return { ok: false, stale: true, message: `The definition of ${request.database}.${request.table} has changed` };
 			}
@@ -187,7 +188,7 @@ export class Database {
 	/// Brings the engine up to date with the catalog, which attaches the tables, and runs a query, which compiles the
 	/// code that queries run first.
 	warm(): Promise<void> {
-		return this.exclusive(async () => {
+		return this.exclusive("warm", async () => {
 			await this.sync();
 			const nothing = async () => {
 				throw new Error("Warming the engine reads no parts");
@@ -201,7 +202,7 @@ export class Database {
 
 	/// Runs a merge from the queue. A merge that loses to a concurrent change runs again against the new catalog.
 	merge(message: MergeMessage, io: Io): Promise<number> {
-		return this.exclusive(async () => {
+		return this.exclusive("merge", async () => {
 			let merged = 0;
 			for (let attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
 				await this.sync();
@@ -235,7 +236,7 @@ export class Database {
 	private async run(query: string | Uint8Array, format: string, io: Io, readonly: boolean, timings: Timings, input?: QueryInput): Promise<QueryResult> {
 		this.retry_reason = undefined;
 		for (let attempt = 1; ; ++attempt) {
-			const step = await this.exclusive(() => this.prepare(query, format, io, readonly, timings, input));
+			const step = await this.exclusive("query", () => this.prepare(query, format, io, readonly, timings, input));
 			if (step.kind === "done") {
 				return step.result;
 			}
@@ -543,7 +544,7 @@ export class Database {
 			io.background(this.deleteParts(written));
 			return false;
 		}
-		await this.exclusive(() => this.apply(changes, version, io));
+		await this.exclusive("apply", () => this.apply(changes, version, io));
 		return true;
 	}
 
@@ -736,7 +737,7 @@ export class Database {
 		}
 	}
 
-	private async exclusive<T>(f: () => Promise<T>): Promise<T> {
+	private async exclusive<T>(what: string, f: () => Promise<T>): Promise<T> {
 		const previous = this.queue;
 		let release!: () => void;
 		this.queue = new Promise<void>((resolve) => (release = resolve));
@@ -747,10 +748,12 @@ export class Database {
 			this.waiting -= 1;
 		}
 		this.held_since = Date.now();
+		this.held_by = what;
 		try {
 			return await f();
 		} finally {
 			this.held_since = undefined;
+			this.held_by = undefined;
 			release();
 		}
 	}
@@ -758,14 +761,21 @@ export class Database {
 	/// How long the work that holds the lock has run, and how much more is waiting for it: the gateway sends a query to
 	/// the less busy of two engines (`askPool`), so that it does not wait behind a long query, or a stuck one.
 	busy(now: number = Date.now()): EngineLoad {
-		return { running_ms: this.held_since === undefined ? 0 : now - this.held_since, queued: this.waiting };
+		return {
+			running_ms: this.held_since === undefined ? 0 : now - this.held_since,
+			queued: this.waiting,
+			...(this.held_by === undefined ? {} : { step: this.held_by }),
+		};
 	}
 }
 
-/// What `Database.busy` says.
+/// What `Database.busy` says. `step` is the work that holds the lock, and `waits` the calls with a deadline that the
+/// isolate waits on (`pendingWaits`): a lock that is held with no such call is waiting on something else.
 export interface EngineLoad {
 	running_ms: number;
 	queued: number;
+	step?: string;
+	waits?: string[];
 }
 
 /// What a query that ran in the engine leaves to do.

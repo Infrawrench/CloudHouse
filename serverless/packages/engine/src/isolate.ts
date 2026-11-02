@@ -1,6 +1,6 @@
 import { exports } from "cloudflare:workers";
 import { Catalog } from "./catalog";
-import { READ_DEADLINE_MS, SHARD_DEADLINE_MS, withDeadline } from "./deadline";
+import { pendingWaits, READ_DEADLINE_MS, SHARD_DEADLINE_MS, withDeadline } from "./deadline";
 import { DEFAULT_LIMITS, Database, type EngineLoad, type Io, type Limits, type MergeMessage, type ShardRequest, type Timings } from "./database";
 import { Engine } from "./engine";
 import type { Env } from "./env";
@@ -18,13 +18,40 @@ import type { ShardAnswer } from "./database";
 let database: Promise<Database> | undefined;
 /// `database` once it has started, for `engineLoad`, which must answer without waiting.
 let started: Database | undefined;
+/// When `database` began to start, while it starts.
+let starting_since: number | undefined;
 
 function getDatabase(env: Env): Promise<Database> {
-	database ??= createDatabase(env).then((db) => (started = db)).catch((error: unknown) => {
-		database = undefined;
-		throw error;
-	});
+	if (database === undefined) {
+		const since = Date.now();
+		starting_since = since;
+		const current: Promise<Database> = createDatabase(env).then(
+			(db) => {
+				if (database === current) {
+					started = db;
+					starting_since = undefined;
+				}
+				return db;
+			},
+			(error: unknown) => {
+				if (database === current) {
+					database = undefined;
+					starting_since = undefined;
+				}
+				throw error;
+			},
+		);
+		database = current;
+	}
 	return database;
+}
+
+/// Gives up the engine of this isolate, which is stuck (`EngineHost.resetIfStuck`): the next work starts a new one.
+/// The work that waits on the old one goes on waiting, until its object is reset.
+export function abandonEngine(): void {
+	database = undefined;
+	started = undefined;
+	starting_since = undefined;
 }
 
 /// Runs `work` on the database of this isolate. An exception that escapes it may have left the engine half way through
@@ -36,8 +63,7 @@ async function withDatabase<T>(env: Env, work: (db: Database) => Promise<T>): Pr
 		return await work(db);
 	} catch (error) {
 		if (database === current) {
-			database = undefined;
-			started = undefined;
+			abandonEngine();
 		}
 		throw error;
 	}
@@ -217,8 +243,13 @@ function warmShards(env: Env): Promise<unknown> {
 }
 
 /// How busy the engine of this isolate is: idle if it has not started, since a query then waits only for it to start.
-export function engineLoad(): EngineLoad {
-	return database === undefined || started === undefined ? { running_ms: 0, queued: 0 } : started.busy();
+/// How busy the engine of this isolate is: an engine that starts is busy starting.
+export function engineLoad(now: number = Date.now()): EngineLoad {
+	const waits = pendingWaits(now);
+	if (starting_since !== undefined) {
+		return { running_ms: now - starting_since, queued: 0, step: "startup", waits };
+	}
+	return started === undefined ? { running_ms: 0, queued: 0 } : { ...started.busy(now), waits };
 }
 
 export async function runWarm(env: Env): Promise<void> {

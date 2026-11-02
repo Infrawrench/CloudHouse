@@ -16,17 +16,32 @@ export class DeadlineExceeded extends Error {
 	override name = "DeadlineExceeded";
 }
 
+/// The waits with a deadline of this isolate, and when each began, for `pendingWaits`.
+const waits = new Map<symbol, { what: string; since: number }>();
+
 /// `promise`, or a `DeadlineExceeded` if it has not settled within `ms`. The call itself goes on; only the wait ends.
 export async function withDeadline<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const deadline = new Promise<never>((_, reject) => {
 		timer = setTimeout(() => reject(new DeadlineExceeded(`${what} did not answer within ${ms / 1000} s`)), ms);
 	});
+	const key = Symbol();
+	waits.set(key, { what, since: Date.now() });
 	try {
 		return await Promise.race([promise, deadline]);
 	} finally {
+		waits.delete(key);
 		if (timer !== undefined) {
 			clearTimeout(timer);
 		}
 	}
+}
+
+/// What the isolate waits on with a deadline, the longest first, for the diagnosis of an engine that is stuck: a wait
+/// that is not here has no deadline.
+export function pendingWaits(now: number = Date.now(), limit = 5): string[] {
+	return [...waits.values()]
+		.sort((a, b) => a.since - b.since)
+		.slice(0, limit)
+		.map(({ what, since }) => `${what} (${Math.round((now - since) / 1000)} s)`);
 }

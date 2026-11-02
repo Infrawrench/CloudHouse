@@ -2,8 +2,9 @@ import { SELF, createExecutionContext, createMessageBatch, getQueueResult, runDu
 import { env, exports } from "cloudflare:workers";
 import worker from "../src/index";
 import { Catalog } from "../src/catalog";
-import { DeadlineExceeded, withDeadline } from "../src/deadline";
-import { leastBusy, pickTwo, preferWarm } from "../src/pool";
+import { DeadlineExceeded, pendingWaits, withDeadline } from "../src/deadline";
+import { STUCK_MS, stuckCall } from "../src/host";
+import { leastBusy, pickTwo, preferWarm, stalled } from "../src/pool";
 import { describe, expect, it } from "vitest";
 
 const authorization = { Authorization: "Bearer test-token" };
@@ -247,5 +248,32 @@ describe("withDeadline", () => {
 		const never = new Promise<number>(() => {});
 		await expect(withDeadline(never, 10, "Shard 4")).rejects.toThrow(DeadlineExceeded);
 		await expect(withDeadline(never, 10, "Shard 4")).rejects.toThrow("Shard 4 did not answer within 0.01 s");
+	});
+
+	it("lists the waits that are open, the longest first", async () => {
+		const never = new Promise<number>(() => {});
+		const waiting = [withDeadline(never, 1_000, "The catalog"), withDeadline(never, 1_000, "Shard 2")];
+		await withDeadline(Promise.resolve(1), 1_000, "The read of part a");
+		expect(pendingWaits(Date.now() + 2_000)).toEqual(["The catalog (2 s)", "Shard 2 (2 s)"]);
+		await Promise.allSettled(waiting);
+		expect(pendingWaits()).toEqual([]);
+	});
+});
+
+describe("stalled", () => {
+	it("passes over an engine that runs long, starts, or does not answer", () => {
+		expect(stalled({ running_ms: 200, queued: 2 })).toBe(false);
+		expect(stalled({ running_ms: 31_000, queued: 0, step: "query" })).toBe(true);
+		expect(stalled(undefined)).toBe(true);
+	});
+});
+
+describe("stuckCall", () => {
+	it("finds the call that has run for longer than the object waits", () => {
+		const now = 10 * STUCK_MS;
+		const query = { what: "query", since: now - STUCK_MS - 1 };
+		expect(stuckCall([{ what: "shard", since: now - 1_000 }, query], now)).toBe(query);
+		expect(stuckCall([{ what: "shard", since: now - STUCK_MS }], now)).toBeUndefined();
+		expect(stuckCall([], now)).toBeUndefined();
 	});
 });
