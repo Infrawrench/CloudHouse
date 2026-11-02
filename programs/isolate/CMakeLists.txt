@@ -39,9 +39,11 @@ target_link_options(clickhouse-isolate PRIVATE
     "-sEXPORTED_FUNCTIONS=_ch_isolate_init,_ch_isolate_query,_ch_isolate_host_query,_ch_isolate_set_parts,_ch_isolate_changes,_ch_isolate_clear_changes,_ch_isolate_set_fanout,_ch_isolate_fanout_requests,_ch_isolate_add_fanout_result,_ch_isolate_clear_fanout,_ch_isolate_shard_query,_ch_isolate_result_data,_ch_isolate_result_size,_malloc,_free"
     "-sEXPORTED_RUNTIME_METHODS=HEAPU8"
     # The memory of an isolate, 128 MB, holds the JavaScript heap as well as the linear memory, so the linear memory
-    # stops at 100 MiB: past that, allocations fail with an exception instead of the isolate being killed. The parser
+    # stops at 88 MiB: past that, allocations fail with an exception instead of the isolate being killed. At 100 MiB,
+    # the JavaScript heap of the Worker (the cached and read-ahead ranges of parts, the responses) did not fit beside
+    # it, and Cloudflare reset the isolate (2026-11-02). The parser
     # and the analyzer recurse deeply, so the stack stays large.
     -sSTACK_SIZE=2097152
     -sINITIAL_MEMORY=50331648
     -sALLOW_MEMORY_GROWTH=1
-    -sMAXIMUM_MEMORY=104857600)
+    -sMAXIMUM_MEMORY=92274688)

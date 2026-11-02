@@ -264,13 +264,14 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
   one after it. With `KEEP_WARM_SECONDS` (50 on `cloudhouse-instances`), an engine of the pool or a shard that has
   been used has an alarm that often, which syncs its engine and keeps the object from being evicted, until it has
   had no use for a day. It costs the time of 24 objects in Durable Objects, about $10 to $15 a month.
-- **Memory.** A query can use up to 72 MiB of the memory of an engine, and fails with `MEMORY_LIMIT_EXCEEDED`
-  beyond that. Reads and merges stream, so this limits the state of a query (a hash table of `GROUP BY`, a sort, the
+- **Memory.** A query can use up to 56 MiB of the memory of an engine, and the engine 60 MiB in all, with the
+  indexes of parts that it caches (8 MiB at most); a query fails with `MEMORY_LIMIT_EXCEEDED` beyond that. Reads and merges stream, so this limits the state of a query (a hash table of `GROUP BY`, a sort, the
   right side of a `JOIN`), not the size of a table. A query puts each part it writes in R2 as soon as it is written,
   and holds none of them until it commits. The ranges of parts that the Worker reads ahead (6 MiB) and caches (4
   MiB), and the runs of blocks that it reads at once (2 MiB), are small, because they share the 128 MB of the
-  isolate with the engine, which may grow to 100 MiB. Before, a large `INSERT ... SELECT` could exceed the memory of
-  the isolate, which Cloudflare then resets. `OPTIMIZE TABLE ... FINAL` of 88 MiB in 16 partitions takes 26 s.
+  isolate with the engine, which may grow to 88 MiB. Before, a large `INSERT ... SELECT` could exceed the memory of
+  the isolate, which Cloudflare then resets. So could a wide `SELECT *` when the engine could grow to 100 MiB, and the
+  cache of indexes kept the `bloom_filter` granules of every part it had read (2026-11-02). `OPTIMIZE TABLE ... FINAL` of 88 MiB in 16 partitions takes 26 s.
   `uniqExact` of 2 million distinct strings is beyond it, while
   `uniq` is not.
 - **Deadlines.** A query holds the lock of its database while it reads parts, syncs with the catalog and waits for
@@ -420,7 +421,7 @@ isolate memory limit. Milestone 1 has to close both gaps.
 
 Measured 2026-11-01 with `clickhouse-isolate`: 58.5 MiB of code (60,136 KiB in `wrangler deploy`, against
 65,536 KiB) and 11.9 MiB of static data in the asset. With Parquet, Arrow, Avro and the other formats, and without
-the dead code: 59.9 MiB of code (61,509 KiB) and 13.9 MiB of static data. The linear memory starts at 48 MiB, and stops at 100 MiB
+the dead code: 59.9 MiB of code (61,509 KiB) and 13.9 MiB of static data. The linear memory starts at 48 MiB, and stops at 88 MiB
 so that the isolate stays under 128 MB. In Node, compiling the module takes about 80 ms and starting the engine
 about 90 ms. A warm `SELECT 1` takes 0.3 ms, and summing a million numbers takes 2 ms.
 

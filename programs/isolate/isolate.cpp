@@ -118,7 +118,7 @@ constexpr auto users_xml = R"XML(<clickhouse>
             <!-- The squashing of `Pretty` formats waits for the next block on a thread of its own. -->
             <output_format_pretty_squash_consecutive_ms>0</output_format_pretty_squash_consecutive_ms>
             <log_queries>0</log_queries>
-            <max_memory_usage>67108864</max_memory_usage>
+            <max_memory_usage>58720256</max_memory_usage>
             <max_bytes_before_external_group_by>0</max_bytes_before_external_group_by>
             <max_bytes_before_external_sort>0</max_bytes_before_external_sort>
             <!-- An `INSERT` makes a part of each block of this many rows, which it holds in memory. -->
@@ -128,7 +128,7 @@ constexpr auto users_xml = R"XML(<clickhouse>
             <distributed_aggregation_memory_efficient>0</distributed_aggregation_memory_efficient>
             <!-- What an isolate depends on: a query may lower the memory it uses, but not raise it, nor use threads. -->
             <constraints>
-                <max_memory_usage><max>67108864</max></max_memory_usage>
+                <max_memory_usage><max>58720256</max></max_memory_usage>
                 <max_threads><const/></max_threads>
                 <max_insert_threads><const/></max_insert_threads>
                 <max_final_threads><const/></max_final_threads>
@@ -218,10 +218,10 @@ void initialize()
     registerIsolate();
     setSecretArgumentsFinder(&SecretArgumentsRegistry::instance());
 
-    /// Well below the 100 MiB of linear memory, which also holds the static data and the stack, and loses some to
-    /// fragmentation: an engine that runs out of memory throws `MEMORY_LIMIT_EXCEEDED` for the query, rather than
-    /// failing an allocation anywhere. The loaded parts count too, up to `ObjectPartStore::loaded_parts_budget`.
-    total_memory_tracker.setHardLimit(72 * 1024 * 1024);
+    /// Well below the 88 MiB of linear memory (`MAXIMUM_MEMORY`), which also holds the static data (14 MiB) and the
+    /// stack (2 MiB), and loses some to fragmentation: an engine that runs out of memory throws `MEMORY_LIMIT_EXCEEDED`
+    /// for the query, rather than failing an allocation anywhere. The cached indexes of parts count too.
+    total_memory_tracker.setHardLimit(60 * 1024 * 1024);
 
     /// The pools run their jobs inline (see `ThreadPoolImpl::scheduleImpl`), so the sizes only need to be positive.
     GlobalThreadPool::initialize(1, 0, 0);

@@ -67,8 +67,11 @@ constexpr size_t footer_size = 3 * sizeof(UInt64) + magic.size();
 /// The end of a part that is read at once, which holds the footer and, mostly, the index: a few KiB, unless the part
 /// has many blocks or a data skipping index with large granules, which take a second read.
 constexpr size_t tail_size = 16 * 1024;
-/// How many indexes the isolate keeps: they are small, and a part never changes.
-constexpr size_t index_cache_size = 4096;
+/// The indexes that the isolate keeps, a part never changes: at most this many bytes of them, as they are stored. An
+/// index is small without a data skipping index, but a `bloom_filter` has a granule of some KiB for each block: the
+/// indexes of `prices` of the pricing warehouse took 14 MiB, which a query that read all its parts kept for good, and
+/// the engine ran out of memory.
+constexpr size_t index_cache_bytes = 8 * 1024 * 1024;
 
 const String min_prefix = "_min.";
 const String max_prefix = "_max.";
@@ -475,9 +478,15 @@ void prefetchPartBlocks(const String & part, const ObjectPartIndex & index, cons
 namespace
 {
 
-std::unordered_map<String, ObjectPartIndexPtr> & indexCache()
+struct CachedIndex
 {
-    static std::unordered_map<String, ObjectPartIndexPtr> cache;
+    ObjectPartIndexPtr index;
+    size_t bytes = 0;
+};
+
+std::unordered_map<String, CachedIndex> & indexCache()
+{
+    static std::unordered_map<String, CachedIndex> cache;
     return cache;
 }
 
@@ -486,15 +495,16 @@ std::unordered_map<String, ObjectPartIndexPtr> & indexCache()
 ObjectPartIndexPtr cachedPartIndex(const String & part)
 {
     auto it = indexCache().find(part);
-    return it == indexCache().end() ? nullptr : it->second;
+    return it == indexCache().end() ? nullptr : it->second.index;
 }
 
 ObjectPartIndexPtr readPartIndex(const String & part, UInt64 bytes)
 {
     auto & cache = indexCache();
     static std::deque<String> order;
+    static size_t cached_bytes = 0;
     if (auto it = cache.find(part); it != cache.end())
-        return it->second;
+        return it->second.index;
 
     if (bytes < footer_size + 16)
         throw Exception(ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED, "Part {} is too small", part);
@@ -520,12 +530,18 @@ ObjectPartIndexPtr readPartIndex(const String & part, UInt64 bytes)
     else
         index = parseIndex(readPartRange(part, index_offset, index_size), index_revision, format);
 
-    if (cache.size() >= index_cache_size)
+    /// The oldest go first. An index larger than the whole budget is not kept.
+    if (index_size > index_cache_bytes)
+        return index;
+    while (cached_bytes + index_size > index_cache_bytes)
     {
-        cache.erase(order.front());
+        auto oldest = cache.find(order.front());
+        cached_bytes -= oldest->second.bytes;
+        cache.erase(oldest);
         order.pop_front();
     }
-    cache.emplace(part, index);
+    cache.emplace(part, CachedIndex{index, index_size});
+    cached_bytes += index_size;
     order.push_back(part);
     return index;
 }
