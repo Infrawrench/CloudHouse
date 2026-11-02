@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { Catalog } from "../src/catalog";
-import { DEFAULT_LIMITS, Database, type Io, type Limits, type MergeMessage } from "../src/database";
+import { DEFAULT_LIMITS, Database, type Io, type Limits, type MergeMessage, type Timings } from "../src/database";
 import { Engine } from "../src/engine";
 import { collectGarbage } from "../src/garbage";
 import { partKey } from "../src/parts";
@@ -10,7 +10,7 @@ const decoder = new TextDecoder();
 
 /// Isolates of one cluster: each has an engine of its own, and they share the catalog and the bucket. The shards of
 /// a fan-out from isolate `i` are the isolates from `i` on, and merges are collected for the test to run.
-async function cluster(isolates: number, limits: Partial<Limits> = {}, hooks: { beforeShard?: () => Promise<void> } = {}) {
+async function cluster(isolates: number, limits: Partial<Limits> = {}, hooks: { beforeShard?: (index: number) => Promise<void> } = {}) {
 	const data = await (await env.ASSETS.fetch("https://assets.local/clickhouse-isolate.data")).arrayBuffer();
 	const id = env.COORDINATION.newUniqueId();
 	const background: Promise<unknown>[] = [];
@@ -38,7 +38,7 @@ async function cluster(isolates: number, limits: Partial<Limits> = {}, hooks: { 
 		/// Shard 0 is the coordinator itself, as when two Durable Objects share an isolate.
 		async runShard(index, request) {
 			shards.count += 1;
-			await hooks.beforeShard?.();
+			await hooks.beforeShard?.(index);
 			const shard = (self + index) % databases.length;
 			return databases[shard]!.shard(request, io(shard));
 		},
@@ -68,7 +68,7 @@ async function cluster(isolates: number, limits: Partial<Limits> = {}, hooks: { 
 	};
 	const catalog = new Catalog(() => env.COORDINATION.get(id));
 	const parts = async (table: string) => [...(await catalog.snapshot()).tables.values()].find((entry) => entry.table === table)!.parts;
-	return { databases, run, fail, merge, merges, settle, parts, reads, shards };
+	return { databases, io, run, fail, merge, merges, settle, parts, reads, shards };
 }
 
 describe("ObjectMergeTree", () => {
@@ -147,6 +147,25 @@ describe("ObjectMergeTree", () => {
 		/// Neither does a query of rows, which the shards would not reduce.
 		expect(await run(a!, "SELECT sum(length(s)) FROM (SELECT s FROM t WHERE k = 1)")).toBe("2978\n");
 		expect(shards.count).toBe(0);
+	});
+
+	it("runs the part of a slow shard in the coordinator", async () => {
+		/// Shard 1 answers only when the test is over, as an engine that takes long to start.
+		const stuck = Promise.withResolvers<void>();
+		const { databases, io, run } = await cluster(4, { shardBytes: 1, maxShards: 3, hedgeMs: 1 }, {
+			beforeShard: (index) => (index === 1 ? stuck.promise : Promise.resolve()),
+		});
+		const [a] = databases;
+		await run(a!, "CREATE TABLE t (k UInt8, v UInt64) ENGINE = ObjectMergeTree ORDER BY k");
+		for (let i = 0; i < 3; ++i) {
+			await run(a!, `INSERT INTO t SELECT number % 5, number FROM numbers(${i * 1000}, 1000)`);
+		}
+		const timings: Timings = { sync: 0, load: 0, commit: 0 };
+		const result = await a!.query("SELECT k, count(), sum(v) FROM t GROUP BY k ORDER BY k", "", io(0), false, timings);
+		stuck.resolve();
+		expect(result.ok && decoder.decode(result.body)).toBe("0\t600\t898500\n1\t600\t899100\n2\t600\t899700\n3\t600\t900300\n4\t600\t900900\n");
+		expect(timings.shards).toBe(3);
+		expect(timings.hedged).toBe(1);
 	});
 
 	it("renames tables", async () => {

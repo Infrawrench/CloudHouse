@@ -7,6 +7,8 @@ export interface Env extends Tokens {
 	ENGINES: DurableObjectNamespace<EngineHost>;
 	/// How many of them the queries are spread over.
 	ENGINE_POOL: string;
+	/// Where new engines are created, as in the engine's Worker.
+	LOCATION_HINT?: string;
 }
 
 /// The HTTP interface of `packages/engine`, answered by the engines of the pool.
@@ -16,6 +18,6 @@ export default {
 		if (pool === 0) {
 			throw new Error("The gateway needs ENGINE_POOL of at least one engine");
 		}
-		return handleRequest(request, env, (query, session) => askPool(env.ENGINES, pool, query, session));
+		return handleRequest(request, env, (query, session) => askPool(env.ENGINES, pool, query, session, env.LOCATION_HINT));
 	},
 } satisfies ExportedHandler<Env>;

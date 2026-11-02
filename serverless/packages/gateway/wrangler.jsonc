@@ -12,7 +12,8 @@
     ]
   },
   "vars": {
-    "ENGINE_POOL": "8"
+    "ENGINE_POOL": "8",
+    "LOCATION_HINT": "weur"
   },
   "observability": {
     "enabled": true
@@ -29,7 +30,8 @@
         ]
       },
       "vars": {
-        "ENGINE_POOL": "8"
+        "ENGINE_POOL": "8",
+        "LOCATION_HINT": "weur"
       }
     }
   }

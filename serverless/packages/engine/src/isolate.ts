@@ -5,6 +5,7 @@ import { Engine } from "./engine";
 import type { Env } from "./env";
 import type { Answer, QueryRequest } from "./http";
 import { bufferedInput, MAX_QUERY_BODY, type QueryInput, readAll, streamedInput } from "./input";
+import { engineHost } from "./pool";
 
 /// `BAD_ARGUMENTS`.
 const BAD_ARGUMENTS = 36;
@@ -67,6 +68,7 @@ export function limits(env: Env): Limits {
 		mergeBytes: number("mergeBytes", env.MERGE_BYTES),
 		mergeParts: number("mergeParts", env.MERGE_PARTS),
 		mergeThreshold: number("mergeThreshold", env.MERGE_THRESHOLD),
+		hedgeMs: number("hedgeMs", env.HEDGE_MS),
 	};
 }
 
@@ -124,7 +126,7 @@ export function makeIo(env: Env, background: (promise: Promise<unknown>) => void
 			return data;
 		},
 		runShard(index: number, request: ShardRequest): Promise<ShardAnswer> {
-			return env.ENGINE_HOST.get(env.ENGINE_HOST.idFromName(`shard-${index}`)).shard(request);
+			return engineHost(env.ENGINE_HOST, `shard-${index}`, env.LOCATION_HINT).shard(request);
 		},
 		async scheduleMerge(message: MergeMessage) {
 			await env.MERGES.send(message);
@@ -167,13 +169,13 @@ export async function runQuery(env: Env, io: Io, request: QueryRequest): Promise
 		`commit;dur=${timings.commit}`,
 		/// Not durations: the MiB of linear memory of the engine, which only grows, and of cached ranges; the ranges that
 		/// the query read, and how many came from the cache; the KiB that they had; the shards that it fanned out to,
-		/// and the time of the slowest.
+		/// the time of the slowest, and how many of them were slow enough that this engine ran their part too.
 		`memory;dur=${Math.round(db.memoryBytes / 1024 / 1024)}`,
 		`cache;dur=${Math.round(range_cache_bytes / 1024 / 1024)}`,
 		`reads;dur=${io.stats.pages}`,
 		`hits;dur=${io.stats.hits}`,
 		`kib;dur=${Math.round(io.stats.bytes / 1024)}`,
-		...(timings.shards ? [`shards;dur=${timings.shards}`, `slowest_shard;dur=${timings.slowest_shard}`] : []),
+		...(timings.shards ? [`shards;dur=${timings.shards}`, `slowest_shard;dur=${timings.slowest_shard}`, `hedged;dur=${timings.hedged ?? 0}`] : []),
 	].join(", ");
 	return result.ok ? { ok: true, body: result.body, timing } : { ok: false, code: result.code, message: result.message, timing };
 }
@@ -181,7 +183,7 @@ export async function runQuery(env: Env, io: Io, request: QueryRequest): Promise
 /// Starts the engines of the shards.
 function warmShards(env: Env): Promise<unknown> {
 	const shards = limits(env).maxShards;
-	return Promise.allSettled(Array.from({ length: shards }, (_, i) => env.ENGINE_HOST.get(env.ENGINE_HOST.idFromName(`shard-${i}`)).warm()));
+	return Promise.allSettled(Array.from({ length: shards }, (_, i) => engineHost(env.ENGINE_HOST, `shard-${i}`, env.LOCATION_HINT).warm()));
 }
 
 export async function runWarm(env: Env): Promise<void> {

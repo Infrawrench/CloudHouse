@@ -10,15 +10,22 @@ export function poolSize(value: string | undefined): number {
 	return pool;
 }
 
+/// The `EngineHost` object `name`, created, if it does not exist, where `location_hint` says (`LOCATION_HINT`).
+export function engineHost(hosts: DurableObjectNamespace<EngineHost>, name: string, location_hint?: string): DurableObjectStub<EngineHost> {
+	const id = hosts.idFromName(name);
+	return location_hint ? hosts.get(id, { locationHint: location_hint as DurableObjectLocationHint }) : hosts.get(id);
+}
+
 /// Runs the query in one of the `EngineHost` objects of the pool: the one of the session, or one picked at random.
 export async function askPool(
 	hosts: DurableObjectNamespace<EngineHost>,
 	pool: number,
 	request: QueryRequest,
 	session: string | null = null,
+	location_hint?: string,
 ): Promise<Answer> {
 	const index = session === null ? Math.floor(Math.random() * pool) : hash(session) % pool;
-	const host = hosts.get(hosts.idFromName(`engine-${index}`));
+	const host = engineHost(hosts, `engine-${index}`, location_hint);
 	const start = Date.now();
 	const answer = await host.query(request);
 	return { ...answer, timing: `host;dur=${Date.now() - start}, ${answer.timing}` };

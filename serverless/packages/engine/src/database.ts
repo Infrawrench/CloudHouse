@@ -26,6 +26,9 @@ export interface Limits {
 	mergeParts: number;
 	/// A commit that leaves a table with this many parts schedules a merge.
 	mergeThreshold: number;
+	/// A shard that has not answered when half of the shards have, after twice their time and at least this many
+	/// milliseconds, is most likely an engine that is starting: the coordinator runs its part of the query too.
+	hedgeMs: number;
 }
 
 /// A part decodes to a few times its size, and a merge holds its parts and the merged one: 4 MiB of parts keep a
@@ -36,6 +39,7 @@ export const DEFAULT_LIMITS: Limits = {
 	mergeBytes: 4 * 1024 * 1024,
 	mergeParts: 10,
 	mergeThreshold: 8,
+	hedgeMs: 300,
 };
 
 /// The query of one shard of a fan-out: the coordinator ran its query against catalog `version`, and the shard reads
@@ -82,6 +86,8 @@ export interface Timings {
 	/// The shards of the fan-outs of the query, and the time of the slowest.
 	shards?: number;
 	slowest_shard?: number;
+	/// The shards whose part of the query the coordinator ran itself, because they were slow to answer.
+	hedged?: number;
 }
 
 /// The tables of `ObjectMergeTree` of one isolate: the engine, kept in sync with the catalog, with the parts in R2.
@@ -146,20 +152,7 @@ export class Database {
 				return { ok: false, stale: true, message: `The definition of ${request.database}.${request.table} has changed` };
 			}
 		}
-		const read_ahead = new ReadAhead((part, offset, size) => io.readRange(part, offset, size));
-		const reader = {
-			readRange: (part: string, offset: number, size: number) => read_ahead.readRange(part, offset, size),
-			prefetch: (part: string, offset: number, size: number) => read_ahead.prefetch(part, offset, size),
-			writePart: async (part: string) => {
-				throw new Error(`A shard does not write parts, but it wrote ${part}`);
-			},
-		};
-		let result: QueryResult;
-		try {
-			result = await this.engine.shardQuery(request.query, request.database, request.table, request.parts, reader);
-		} catch (error) {
-			result = { ok: false, code: 0, message: String(error) };
-		}
+		const result = await this.runShardQuery(request, io);
 		if (result.ok) {
 			return { ok: true, data: result.body };
 		}
@@ -168,6 +161,22 @@ export class Database {
 		const parts = (await this.catalog.snapshot()).tables.get(key)?.parts ?? [];
 		const gone = request.parts.some((part) => !parts.includes(part));
 		return { ok: false, stale: gone, message: result.message };
+	}
+
+	private async runShardQuery(request: ShardRequest, io: Io): Promise<QueryResult> {
+		const read_ahead = new ReadAhead((part, offset, size) => io.readRange(part, offset, size));
+		const reader = {
+			readRange: (part: string, offset: number, size: number) => read_ahead.readRange(part, offset, size),
+			prefetch: (part: string, offset: number, size: number) => read_ahead.prefetch(part, offset, size),
+			writePart: async (part: string) => {
+				throw new Error(`A shard does not write parts, but it wrote ${part}`);
+			},
+		};
+		try {
+			return await this.engine.shardQuery(request.query, request.database, request.table, request.parts, reader);
+		} catch (error) {
+			return { ok: false, code: 0, message: String(error) };
+		}
 	}
 
 	/// Brings the engine up to date with the catalog, which attaches the tables, and runs a query, which compiles the
@@ -355,14 +364,8 @@ export class Database {
 			throw new Error(`The engine fans out ${request.database}.${request.table}, which is not in the catalog`);
 		}
 		const groups = shardParts(table.parts, this.limits.shardBytes, this.limits.maxShards);
-		const answers = await Promise.all(
-			groups.map(async (parts, index) => {
-				const start = Date.now();
-				const answer = await io.runShard(index, { createQuery: table.createQuery, database: table.database, table: table.table, parts, query: request.query });
-				timings.slowest_shard = Math.max(timings.slowest_shard ?? 0, Date.now() - start);
-				return answer;
-			}),
-		);
+		const requests = groups.map((parts) => ({ createQuery: table.createQuery, database: table.database, table: table.table, parts, query: request.query }));
+		const answers = await this.runShards(requests, io, timings);
 		timings.shards = (timings.shards ?? 0) + groups.length;
 		for (const answer of answers) {
 			if (!answer.ok) {
@@ -375,6 +378,59 @@ export class Database {
 			}
 		}
 		return "done";
+	}
+
+	/// Runs the shards, and the part of a shard that is slow to answer here too: an engine that starts takes a second or
+	/// more, where the others take a fraction of that, and a query that fans out to many shards would otherwise wait for
+	/// one that starts more often than not. The parts of the slow shards run here one at a time, and each shard has the
+	/// answer that comes first. If its part fails here, the shard's own answer counts, whatever it is.
+	private async runShards(requests: ShardRequest[], io: Io, timings: Timings): Promise<ShardAnswer[]> {
+		const start = Date.now();
+		const answers: ShardAnswer[] = [];
+		const pending = new Set(requests.keys());
+		let changed = Promise.withResolvers<void>();
+		const settle = (index: number, answer: ShardAnswer) => {
+			if (!pending.delete(index)) {
+				return;
+			}
+			answers[index] = answer;
+			timings.slowest_shard = Math.max(timings.slowest_shard ?? 0, Date.now() - start);
+			changed.resolve();
+			changed = Promise.withResolvers<void>();
+		};
+		for (const [index, request] of requests.entries()) {
+			io.runShard(index, request).then(
+				(answer) => settle(index, answer),
+				(error: unknown) => settle(index, { ok: false, stale: false, message: String(error) }),
+			);
+		}
+		const half = Math.ceil(requests.length / 2);
+		while (pending.size > 0 && requests.length - pending.size < half) {
+			await changed.promise;
+		}
+		/// With one shard, `half` is all of them.
+		if (pending.size > 0) {
+			const deadline = start + Math.max(this.limits.hedgeMs, 2 * (Date.now() - start));
+			while (pending.size > 0 && Date.now() < deadline) {
+				let timer = 0;
+				await Promise.race([changed.promise, new Promise<void>((resolve) => (timer = setTimeout(resolve, deadline - Date.now())))]);
+				clearTimeout(timer);
+			}
+			for (const index of [...pending]) {
+				if (!pending.has(index)) {
+					continue;
+				}
+				const result = await this.runShardQuery(requests[index]!, io);
+				if (result.ok && pending.has(index)) {
+					timings.hedged = (timings.hedged ?? 0) + 1;
+					settle(index, { ok: true, data: result.body });
+				}
+			}
+			while (pending.size > 0) {
+				await changed.promise;
+			}
+		}
+		return answers;
 	}
 
 	/// Merges `group`, some of the parts of the table, into one, with `OPTIMIZE`, which merges the visible parts.

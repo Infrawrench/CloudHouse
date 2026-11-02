@@ -44,8 +44,11 @@
   "triggers": {
     "crons": ["17 * * * *"]
   },
+  // `LOCATION_HINT`: new engines, shards and merge objects are created in Western Europe, beside the catalog and
+  // the bucket, rather than near whichever request or queue consumer first used them.
   "vars": {
-    "ENGINE_POOL": "8"
+    "ENGINE_POOL": "8",
+    "LOCATION_HINT": "weur"
   },
   // The parts of the tables.
   "r2_buckets": [
@@ -76,7 +79,8 @@
       // The engines keep running between the queries of a chat, see `EngineHost`.
       "vars": {
         "ENGINE_POOL": "8",
-        "KEEP_WARM_SECONDS": "50"
+        "KEEP_WARM_SECONDS": "15",
+        "LOCATION_HINT": "weur"
       },
       "r2_buckets": [
         { "binding": "PARTS", "bucket_name": "cloudhouse-instances-parts" }

@@ -25,4 +25,9 @@ export interface Env extends Tokens {
 	MERGE_BYTES?: string;
 	MERGE_PARTS?: string;
 	MERGE_THRESHOLD?: string;
+	HEDGE_MS?: string;
+	/// Where new `EngineHost` objects are created (`DurableObjectLocationHint`, such as `weur`): near the catalog and
+	/// the bucket. An object stays where it was created, so the merges, which a queue consumer anywhere starts, have
+	/// objects of their own for each hint. Without it, an object is created near the request that first uses it.
+	LOCATION_HINT?: string;
 }
