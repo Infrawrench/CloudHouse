@@ -1,4 +1,5 @@
 import { type Coordination, ErrorCode, type MultiResult, type Op, type OpResult } from "coordination";
+import { CATALOG_DEADLINE_MS, withDeadline } from "./deadline";
 import type { CatalogChange } from "./engine";
 
 /// The catalog of the tables of `ObjectMergeTree`: their definitions and their parts, in a `Coordination` object.
@@ -65,7 +66,7 @@ export class Catalog {
 
 	/// Creates the session ahead of the first request to the catalog.
 	async connect(): Promise<void> {
-		this.session ??= await this.coordination().createSession(SESSION_TIMEOUT_MS);
+		this.session ??= await withDeadline(this.coordination().createSession(SESSION_TIMEOUT_MS), CATALOG_DEADLINE_MS, "The catalog");
 	}
 
 	async version(): Promise<number> {
@@ -280,18 +281,24 @@ export class Catalog {
 		if (ops.length === 0) {
 			return { error: ErrorCode.ZOK, results: [] };
 		}
-		return this.withSession((session) => this.coordination().multi(session, ops), (result) => result.error);
+		/// A write transaction that misses its deadline may still be applied, as with the timeout of the HTTP interface.
+		const what = ops.some((op) => op.type === "create" || op.type === "remove" || op.type === "set")
+			? "The commit to the catalog (which may still be applied)"
+			: "The catalog";
+		return this.withSession((session) => this.coordination().multi(session, ops), (result) => result.error, what);
 	}
 
-	/// Runs `f` in the session of this isolate, which is created again if it has expired.
-	private async withSession<T>(f: (session: number) => Promise<T>, error: (result: T) => ErrorCode): Promise<T> {
-		this.session ??= await this.coordination().createSession(SESSION_TIMEOUT_MS);
-		const result = await f(this.session);
+	/// Runs `f` in the session of this isolate, which is created again if it has expired. Each call has a deadline: a
+	/// query syncs with the catalog with the lock of its database held (`deadline.ts`).
+	private async withSession<T>(f: (session: number) => Promise<T>, error: (result: T) => ErrorCode, what = "The catalog"): Promise<T> {
+		const call = <R>(promise: Promise<R>) => withDeadline(promise, CATALOG_DEADLINE_MS, what);
+		this.session ??= await call(this.coordination().createSession(SESSION_TIMEOUT_MS));
+		const result = await call(f(this.session));
 		if (error(result) !== ErrorCode.ZSESSIONEXPIRED) {
 			return result;
 		}
-		this.session = await this.coordination().createSession(SESSION_TIMEOUT_MS);
-		return f(this.session);
+		this.session = await call(this.coordination().createSession(SESSION_TIMEOUT_MS));
+		return call(f(this.session));
 	}
 }
 

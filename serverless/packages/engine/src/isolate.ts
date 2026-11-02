@@ -1,6 +1,7 @@
 import { exports } from "cloudflare:workers";
 import { Catalog } from "./catalog";
-import { DEFAULT_LIMITS, Database, type Io, type Limits, type MergeMessage, type ShardRequest, type Timings } from "./database";
+import { READ_DEADLINE_MS, SHARD_DEADLINE_MS, withDeadline } from "./deadline";
+import { DEFAULT_LIMITS, Database, type EngineLoad, type Io, type Limits, type MergeMessage, type ShardRequest, type Timings } from "./database";
 import { Engine } from "./engine";
 import type { Env } from "./env";
 import type { Answer, QueryRequest } from "./http";
@@ -15,9 +16,11 @@ import type { ShardAnswer } from "./database";
 /// scope of a Worker has to finish within the startup time limit. The tables of `ObjectMergeTree` are in the catalog
 /// and in R2, and every isolate sees them; the tables of `Memory` last as long as the isolate does.
 let database: Promise<Database> | undefined;
+/// `database` once it has started, for `engineLoad`, which must answer without waiting.
+let started: Database | undefined;
 
 function getDatabase(env: Env): Promise<Database> {
-	database ??= createDatabase(env).catch((error: unknown) => {
+	database ??= createDatabase(env).then((db) => (started = db)).catch((error: unknown) => {
 		database = undefined;
 		throw error;
 	});
@@ -34,6 +37,7 @@ async function withDatabase<T>(env: Env, work: (db: Database) => Promise<T>): Pr
 	} catch (error) {
 		if (database === current) {
 			database = undefined;
+			started = undefined;
 		}
 		throw error;
 	}
@@ -99,15 +103,19 @@ export function makeIo(env: Env, background: (promise: Promise<unknown>) => void
 	/// The loopback binding of `PartCache`, which goes through the cache of the Worker.
 	const cache = (exports as unknown as { PartCache: Fetcher }).PartCache;
 	const stats = { pages: 0, bytes: 0, hits: 0 };
-	const fetchRange = async (part: string, offset: number, size: number) => {
+	const read = async (part: string, offset: number, size: number) => {
 		const response = await cache.fetch(`https://parts/${part}/${offset}/${size}`);
 		if (response.status !== 200) {
 			throw new Error(`Cannot read part ${part}: ${response.status} ${await response.text()}`);
 		}
-		const data = new Uint8Array(await response.arrayBuffer());
+		return { data: new Uint8Array(await response.arrayBuffer()), hit: response.headers.get("CF-Cache-Status") === "HIT" };
+	};
+	/// The engine waits for a read with the lock of its database held, so a read that hangs fails instead (`deadline.ts`).
+	const fetchRange = async (part: string, offset: number, size: number) => {
+		const { data, hit } = await withDeadline(read(part, offset, size), READ_DEADLINE_MS, `The read of part ${part}`);
 		stats.pages += 1;
 		stats.bytes += data.length;
-		stats.hits += response.headers.get("CF-Cache-Status") === "HIT" ? 1 : 0;
+		stats.hits += hit ? 1 : 0;
 		return data;
 	};
 	return {
@@ -130,7 +138,9 @@ export function makeIo(env: Env, background: (promise: Promise<unknown>) => void
 			const object = shardObjects(env)[index]!;
 			let answer: ShardAnswer;
 			try {
-				answer = await engineHost(env.ENGINE_HOST, `shard-${object}`, env.LOCATION_HINT).shard(request);
+				/// The coordinator waits for its shards with the lock of its database held, see `deadline.ts`.
+				const host = engineHost(env.ENGINE_HOST, `shard-${object}`, env.LOCATION_HINT);
+				answer = await withDeadline(host.shard(request) as Promise<ShardAnswer>, SHARD_DEADLINE_MS, `Shard ${object}`);
 			} catch (error) {
 				shard_cold_at.set(object, Date.now());
 				throw error;
@@ -204,6 +214,11 @@ function shardObjects(env: Env): number[] {
 function warmShards(env: Env): Promise<unknown> {
 	const objects = shardObjects(env).slice(0, limits(env).maxShards);
 	return Promise.allSettled(objects.map((object) => engineHost(env.ENGINE_HOST, `shard-${object}`, env.LOCATION_HINT).warm()));
+}
+
+/// How busy the engine of this isolate is: idle if it has not started, since a query then waits only for it to start.
+export function engineLoad(): EngineLoad {
+	return database === undefined || started === undefined ? { running_ms: 0, queued: 0 } : started.busy();
 }
 
 export async function runWarm(env: Env): Promise<void> {

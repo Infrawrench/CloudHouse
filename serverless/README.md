@@ -151,7 +151,10 @@ The module of the engine makes a new isolate of its Worker take about a second t
 Cloudflare starts a new isolate for most requests. So the queries run elsewhere:
 
 - `clickhouse-engine` is the gateway (`packages/gateway`), 3 KiB, with the HTTP interface. It sends every query
-  to one of `ENGINE_POOL` (8) `EngineHost` objects, picked at random, or by `session_id`.
+  to one of `ENGINE_POOL` (8) `EngineHost` objects: by `session_id`, or else to the less busy of two picked at random
+  among the warm ones. Each says how long its running query has run and how many wait (`EngineHost.busy`, answered
+  within 250 ms or taken as busy), because an engine runs one query at a time: picked at random alone, one query in
+  eight waited behind a long query, and behind a stuck engine, forever.
 - `clickhouse-engine-core` (`packages/engine`, not public) has the engine. An `EngineHost` (`src/host.ts`) is a
   Durable Object, so it stays in one isolate on one machine and its engine stays warm. It runs queries exactly as
   the Worker would (`src/isolate.ts`), syncing with the catalog first. With `ENGINE_POOL` = 0, the Worker runs
@@ -270,6 +273,12 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
   the isolate, which Cloudflare then resets. `OPTIMIZE TABLE ... FINAL` of 88 MiB in 16 partitions takes 26 s.
   `uniqExact` of 2 million distinct strings is beyond it, while
   `uniq` is not.
+- **Deadlines.** A query holds the lock of its database while it reads parts, syncs with the catalog and waits for
+  its shards, and every later query of the engine waits for that lock. So each of those waits has a deadline
+  (`src/deadline.ts`): 60 s for a shard, 30 s for a range of a part and for a call to the catalog. A wait that runs
+  out fails the query and releases the lock. Before, a shard that never answered left its coordinator holding the
+  lock for good: the engine answered nothing, not even `SELECT 1`, and the alarms of `KEEP_WARM_SECONDS` kept its
+  object from being reset. A commit to the catalog that runs out says that it may still be applied.
 - **Garbage.** An hourly Cron Trigger (`src/garbage.ts`) deletes the parts in R2 that no table has and that are
   older than an hour: the parts of a commit that failed and were not deleted then. A bucket belongs to one catalog.
 

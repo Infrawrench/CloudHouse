@@ -2,7 +2,8 @@ import { SELF, createExecutionContext, createMessageBatch, getQueueResult, runDu
 import { env, exports } from "cloudflare:workers";
 import worker from "../src/index";
 import { Catalog } from "../src/catalog";
-import { preferWarm } from "../src/pool";
+import { DeadlineExceeded, withDeadline } from "../src/deadline";
+import { leastBusy, pickTwo, preferWarm } from "../src/pool";
 import { describe, expect, it } from "vitest";
 
 const authorization = { Authorization: "Bearer test-token" };
@@ -215,5 +216,36 @@ describe("preferWarm", () => {
 		]);
 		expect(preferWarm(6, cold_at, now)).toEqual([0, 2, 4, 5, 1, 3]);
 		expect(preferWarm(3, new Map(), now)).toEqual([0, 1, 2]);
+	});
+});
+
+describe("pickTwo", () => {
+	it("picks two different engines, or the only one", () => {
+		for (const r of [0, 0.3, 0.6, 0.99]) {
+			const [a, b] = pickTwo([2, 5, 7], () => r);
+			expect(a).not.toBe(b);
+			expect([2, 5, 7]).toContain(a);
+			expect([2, 5, 7]).toContain(b);
+		}
+		expect(pickTwo([4])).toEqual([4]);
+	});
+});
+
+describe("leastBusy", () => {
+	it("prefers fewer queued queries, then the shorter running one, and an engine that answered", () => {
+		expect(leastBusy([1, 2], [{ running_ms: 900, queued: 0 }, { running_ms: 10, queued: 0 }])).toBe(2);
+		expect(leastBusy([1, 2], [{ running_ms: 10, queued: 1 }, { running_ms: 5_000, queued: 0 }])).toBe(2);
+		expect(leastBusy([1, 2], [undefined, { running_ms: 600_000, queued: 3 }])).toBe(2);
+		expect(leastBusy([1, 2], [{ running_ms: 0, queued: 0 }, { running_ms: 0, queued: 0 }])).toBe(1);
+		expect(leastBusy([1, 2], [undefined, undefined])).toBe(1);
+	});
+});
+
+describe("withDeadline", () => {
+	it("passes a result through and fails a wait that runs out", async () => {
+		expect(await withDeadline(Promise.resolve(3), 1_000, "x")).toBe(3);
+		const never = new Promise<number>(() => {});
+		await expect(withDeadline(never, 10, "Shard 4")).rejects.toThrow(DeadlineExceeded);
+		await expect(withDeadline(never, 10, "Shard 4")).rejects.toThrow("Shard 4 did not answer within 0.01 s");
 	});
 });

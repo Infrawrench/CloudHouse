@@ -107,6 +107,9 @@ export class Database {
 	private state: Snapshot = { version: -1, databases: new Set(), tables: new Map() };
 	/// The work runs one piece at a time: the engine is shared by the requests of the isolate.
 	private queue: Promise<unknown> = Promise.resolve();
+	/// When the work that holds the lock took it, and how many wait for it, for `busy`.
+	private held_since: number | undefined;
+	private waiting = 0;
 	/// Why the last query ran again, if it was for an error of the engine, which a query that runs again too many
 	/// times returns.
 	private retry_reason: QueryResult | undefined;
@@ -737,13 +740,32 @@ export class Database {
 		const previous = this.queue;
 		let release!: () => void;
 		this.queue = new Promise<void>((resolve) => (release = resolve));
-		await previous;
+		this.waiting += 1;
+		try {
+			await previous;
+		} finally {
+			this.waiting -= 1;
+		}
+		this.held_since = Date.now();
 		try {
 			return await f();
 		} finally {
+			this.held_since = undefined;
 			release();
 		}
 	}
+
+	/// How long the work that holds the lock has run, and how much more is waiting for it: the gateway sends a query to
+	/// the less busy of two engines (`askPool`), so that it does not wait behind a long query, or a stuck one.
+	busy(now: number = Date.now()): EngineLoad {
+		return { running_ms: this.held_since === undefined ? 0 : now - this.held_since, queued: this.waiting };
+	}
+}
+
+/// What `Database.busy` says.
+export interface EngineLoad {
+	running_ms: number;
+	queued: number;
 }
 
 /// What a query that ran in the engine leaves to do.

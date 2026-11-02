@@ -1,8 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
-import type { MergeMessage, ShardAnswer, ShardRequest } from "./database";
+import type { EngineLoad, MergeMessage, ShardAnswer, ShardRequest } from "./database";
 import type { Env } from "./env";
 import type { Answer, QueryRequest } from "./http";
-import { makeIo, runMerge, runQuery, runShard, runWarm } from "./isolate";
+import { engineLoad, makeIo, runMerge, runQuery, runShard, runWarm } from "./isolate";
 
 /// An engine in a Durable Object. A Durable Object stays on one machine, in one isolate, so its engine stays warm
 /// between queries, where the isolates that Cloudflare picks for requests start a new engine more often than not
@@ -22,6 +22,12 @@ export class EngineHost extends DurableObject<Env> {
 	async query(request: QueryRequest): Promise<Answer> {
 		this.ctx.waitUntil(this.used());
 		return runQuery(this.env, this.io(), request);
+	}
+
+	/// How busy the engine is, for the gateway to choose between engines (`askPool`). It reads two numbers, so it answers
+	/// at once, even while a query waits on I/O.
+	busy(): EngineLoad {
+		return engineLoad();
 	}
 
 	async shard(request: ShardRequest): Promise<ShardAnswer> {

@@ -1,3 +1,4 @@
+import type { EngineLoad } from "./database";
 import type { EngineHost } from "./host";
 import type { Answer, QueryRequest } from "./http";
 
@@ -34,8 +35,51 @@ export function recentlyCold(cold_at: ReadonlyMap<number, number>, index: number
 /// When each engine of the pool last answered with a new engine, in this isolate.
 const engine_cold_at = new Map<number, number>();
 
-/// Runs the query in one of the `EngineHost` objects of the pool: the one of the session, or one picked at random
-/// among those that have answered warm lately.
+/// How long the gateway waits for an engine to say how busy it is. An engine that does not answer in time is taken to
+/// be busy: its isolate is computing, or stuck.
+const LOAD_DEADLINE_MS = 250;
+
+/// Two different engines among `choices`, at random; one if there is only one.
+export function pickTwo(choices: readonly number[], random: () => number = Math.random): number[] {
+	const first = Math.floor(random() * choices.length);
+	if (choices.length < 2) {
+		return choices.slice(first, first + 1);
+	}
+	const second = (first + 1 + Math.floor(random() * (choices.length - 1))) % choices.length;
+	return [choices[first]!, choices[second]!];
+}
+
+/// The less busy of the candidates: the fewest queries waiting, then the shortest running one. `undefined`, an engine
+/// that did not say, comes last. Ties go to the first.
+export function leastBusy(candidates: readonly number[], loads: readonly (EngineLoad | undefined)[]): number {
+	const score = (load: EngineLoad | undefined) => (load === undefined ? Infinity : load.queued * 60_000 + load.running_ms);
+	let best = 0;
+	for (let i = 1; i < candidates.length; i++) {
+		if (score(loads[i]) < score(loads[best])) {
+			best = i;
+		}
+	}
+	return candidates[best]!;
+}
+
+async function loadOf(host: DurableObjectStub<EngineHost>): Promise<EngineLoad | undefined> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const timeout = new Promise<undefined>((resolve) => (timer = setTimeout(() => resolve(undefined), LOAD_DEADLINE_MS)));
+		return await Promise.race([host.busy() as Promise<EngineLoad>, timeout]);
+	} catch {
+		return undefined;
+	} finally {
+		if (timer !== undefined) {
+			clearTimeout(timer);
+		}
+	}
+}
+
+/// Runs the query in one of the `EngineHost` objects of the pool: the one of the session, or else the less busy of two
+/// picked at random among those that have answered warm lately ("the power of two choices"). An engine runs one query
+/// at a time, so a query sent at random to the engine of a long query waited for it, and one sent to a stuck engine
+/// waited forever. Asking two costs a round trip to each, in parallel, and the query goes where it starts soonest.
 export async function askPool(
 	hosts: DurableObjectNamespace<EngineHost>,
 	pool: number,
@@ -46,9 +90,16 @@ export async function askPool(
 	const all = Array.from({ length: pool }, (_, index) => index);
 	const warm = all.filter((index) => !recentlyCold(engine_cold_at, index));
 	const choices = warm.length > 0 ? warm : all;
-	const index = session === null ? choices[Math.floor(Math.random() * choices.length)]! : hash(session) % pool;
-	const host = engineHost(hosts, `engine-${index}`, location_hint);
 	const start = Date.now();
+	let index: number;
+	if (session !== null) {
+		index = hash(session) % pool;
+	} else {
+		const candidates = pickTwo(choices);
+		const loads = await Promise.all(candidates.map((candidate) => loadOf(engineHost(hosts, `engine-${candidate}`, location_hint))));
+		index = leastBusy(candidates, loads);
+	}
+	const host = engineHost(hosts, `engine-${index}`, location_hint);
 	let answer: Answer;
 	try {
 		answer = await host.query(request);
