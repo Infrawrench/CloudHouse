@@ -506,12 +506,9 @@ public:
         const auto * query_node = query_info.query_tree ? query_info.query_tree->as<QueryNode>() : nullptr;
         if (!query_node || !query_info.table_expression || query_node->getJoinTreeNode().get() != query_info.table_expression.get())
             return QueryProcessingStage::FetchColumns;
-        /// A shard sends back its result at once, so only a query that the shards reduce fans out: an aggregation, a
-        /// `DISTINCT` or a `LIMIT`. The rows of the others stream from here.
-        const bool reduces = query_node->hasGroupBy() || hasAggregateFunctionNodes(query_node->getProjectionNode())
-            || query_node->isDistinct() || query_node->hasLimit();
-        if (!reduces)
-            return QueryProcessingStage::FetchColumns;
+        /// A query of rows fans out too: read here, a `SELECT *` with a filter on columns outside the key read 200 MiB of
+        /// parts in one engine, which took tens of seconds and could exceed the memory of the isolate. A shard sends back
+        /// at most `max_shard_result_bytes` (`isolate.cpp`), so one that keeps too many rows fails the query.
         /// A query that its filter keeps to a few blocks, such as a point query, reads them here.
         if (selectedBytes(query_info, context) <= fan_out_bytes)
             return QueryProcessingStage::FetchColumns;

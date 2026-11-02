@@ -82,6 +82,7 @@ namespace ErrorCodes
     extern const int CANNOT_READ_FROM_ISTREAM;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
+    extern const int TOO_MANY_ROWS_OR_BYTES;
 }
 
 namespace
@@ -355,6 +356,12 @@ void runQuery(std::string_view query, std::string_view default_format, bool read
 
 /// Runs the query of a shard up to `WithMergeableState` on `parts` of a table, and makes its result the blocks it
 /// produces.
+/// The most that a shard sends back, in the bytes of its blocks. The result of a shard is held whole, here, in the
+/// Worker, and in the coordinator, which holds those of all its shards: past this, the query fails, rather than the
+/// isolate of the shard or of the coordinator running out of memory. A query that aggregates, or with a `LIMIT`, sends
+/// back much less than this; a query of rows without one, as much as its filter keeps.
+constexpr size_t max_shard_result_bytes = 4 * 1024 * 1024;
+
 void runShardQuery(std::string_view query, const String & database, const String & table, Strings parts)
 {
     auto context = makeQueryContext(/* readonly= */ false);
@@ -371,9 +378,19 @@ void runShardQuery(std::string_view query, const String & database, const String
         /// The header goes first, so that a shard without rows still gives the structure of its result.
         blocks.push_back(executor.getHeader().cloneEmpty());
         Block block;
+        size_t bytes = 0;
         while (executor.pull(block))
-            if (block.rows())
-                blocks.push_back(std::move(block));
+        {
+            if (!block.rows())
+                continue;
+            bytes += block.bytes();
+            if (bytes > max_shard_result_bytes)
+                throw Exception(
+                    ErrorCodes::TOO_MANY_ROWS_OR_BYTES,
+                    "A shard of the query has more than {} MiB of results: aggregate the rows, filter them more, or add a LIMIT",
+                    max_shard_result_bytes / 1024 / 1024);
+            blocks.push_back(std::move(block));
+        }
     }
     io.onFinish();
     result = ObjectPartStore::encodeBlocks(blocks);

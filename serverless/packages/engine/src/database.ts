@@ -395,9 +395,21 @@ export class Database {
 		const answers: ShardAnswer[] = [];
 		const pending = new Set(requests.keys());
 		let changed = Promise.withResolvers<void>();
+		/// The answers so far, which the isolate holds until they all are in.
+		let bytes = 0;
+		let too_large: ShardAnswer | undefined;
 		const settle = (index: number, answer: ShardAnswer) => {
 			if (!pending.delete(index)) {
 				return;
+			}
+			bytes += answer.ok ? answer.data.length : 0;
+			if (bytes > MAX_SHARD_RESULTS_BYTES && too_large === undefined) {
+				too_large = {
+					ok: false,
+					stale: false,
+					message: `The shards of the query sent back more than ${MAX_SHARD_RESULTS_BYTES / 1024 / 1024} MiB of results: aggregate the rows, filter them more, or add a LIMIT`,
+				};
+				pending.clear();
 			}
 			answers[index] = answer;
 			timings.slowest_shard = Math.max(timings.slowest_shard ?? 0, Date.now() - start);
@@ -413,6 +425,9 @@ export class Database {
 		const half = Math.ceil(requests.length / 2);
 		while (pending.size > 0 && requests.length - pending.size < half) {
 			await changed.promise;
+		}
+		if (too_large !== undefined) {
+			return [too_large];
 		}
 		/// With one shard, `half` is all of them.
 		if (pending.size > 0) {
@@ -436,7 +451,7 @@ export class Database {
 				await changed.promise;
 			}
 		}
-		return answers;
+		return too_large === undefined ? answers : [too_large];
 	}
 
 	/// Merges `group`, some of the parts of the table, into one, with `OPTIMIZE`, which merges the visible parts.
@@ -768,6 +783,10 @@ export class Database {
 		};
 	}
 }
+
+/// The most that the shards of one fan-out send back in all: the coordinator holds their answers until they all are in,
+/// in the Worker and in the engine, which decodes them. A shard sends back at most 4 MiB (`max_shard_result_bytes`).
+export const MAX_SHARD_RESULTS_BYTES = 24 * 1024 * 1024;
 
 /// What `Database.busy` says. `step` is the work that holds the lock, and `waits` the calls with a deadline that the
 /// isolate waits on (`pendingWaits`): a lock that is held with no such call is waiting on something else.

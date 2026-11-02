@@ -136,6 +136,7 @@ describe("ObjectMergeTree", () => {
 			"SELECT v, s FROM t ORDER BY v DESC LIMIT 3",
 			"SELECT count(), avg(v), min(v), max(v) FROM t WHERE k != 2",
 			"SELECT k, groupArray(v) FROM (SELECT k, v FROM t WHERE v < 12) GROUP BY k ORDER BY k",
+			"SELECT v, s FROM t WHERE k = 3 AND v % 7 = 0 ORDER BY v",
 		]) {
 			expect(await run(a!, query)).toBe(await reference.run(reference.databases[0]!, query));
 		}
@@ -144,9 +145,21 @@ describe("ObjectMergeTree", () => {
 		shards.count = 0;
 		expect(await run(a!, "SELECT count() FROM t WHERE k = 7")).toBe("0\n");
 		expect(shards.count).toBe(0);
-		/// Neither does a query of rows, which the shards would not reduce.
+		/// A query of rows fans out too.
 		expect(await run(a!, "SELECT sum(length(s)) FROM (SELECT s FROM t WHERE k = 1)")).toBe("2978\n");
-		expect(shards.count).toBe(0);
+		expect(shards.count).toBeGreaterThan(0);
+	});
+
+	it("fails a query whose shards send back too much", async () => {
+		const { databases: [a], run, fail } = await cluster(3, { shardBytes: 1, maxShards: 2 });
+		await run(a!, "CREATE TABLE w (k UInt64, s String) ENGINE = ObjectMergeTree ORDER BY k");
+		for (let i = 0; i < 2; ++i) {
+			await run(a!, `INSERT INTO w SELECT number, repeat('x', 1000) FROM numbers(${i * 5000}, 5000)`);
+		}
+		expect(await fail(a!, "SELECT * FROM w")).toMatch(/more than 4 MiB of results/);
+		/// With a `LIMIT`, or aggregated, the shards send back little.
+		expect(await run(a!, "SELECT k FROM w ORDER BY k LIMIT 2")).toBe("0\n1\n");
+		expect(await run(a!, "SELECT count(), sum(length(s)) FROM w")).toBe("10000\t10000000\n");
 	});
 
 	it("runs the part of a slow shard in the coordinator", async () => {
