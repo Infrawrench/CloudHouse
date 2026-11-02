@@ -79,7 +79,7 @@
       // The engines keep running between the queries of a chat, see `EngineHost`.
       "vars": {
         "ENGINE_POOL": "8",
-        "KEEP_WARM_SECONDS": "15",
+        "KEEP_WARM_SECONDS": "50",
         "LOCATION_HINT": "weur"
       },
       "r2_buckets": [

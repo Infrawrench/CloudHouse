@@ -87,12 +87,16 @@ export class Engine {
 	/// `data` is the static data of the engine, the asset `clickhouse-isolate.data`.
 	static async create(data: ArrayBuffer, log: (line: string) => void = console.error): Promise<Engine> {
 		let engine: Engine | undefined;
+		/// The runtime keeps the arguments of `createClickHouse`, and so `instantiateWasm`: it lets go of the data once
+		/// it is in the linear memory, rather than keep 14 MB more in the isolate for as long as the engine lives.
+		let pending: ArrayBuffer | undefined = data;
 		const module = await createClickHouse({
 			/// A Worker cannot compile WebAssembly at run time; the module is compiled at deploy time and imported.
 			instantiateWasm(imports, done) {
 				const instance = new WebAssembly.Instance(wasm, imports);
 				/// The runtime calls the constructors of the engine once `done` returns, and they read the data.
-				loadData(exportedMemory(instance), data);
+				loadData(exportedMemory(instance), pending!);
+				pending = undefined;
 				done(instance, wasm);
 				return instance.exports;
 			},

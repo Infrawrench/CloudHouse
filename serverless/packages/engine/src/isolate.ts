@@ -5,7 +5,7 @@ import { Engine } from "./engine";
 import type { Env } from "./env";
 import type { Answer, QueryRequest } from "./http";
 import { bufferedInput, MAX_QUERY_BODY, type QueryInput, readAll, streamedInput } from "./input";
-import { engineHost } from "./pool";
+import { engineHost, preferWarm } from "./pool";
 
 /// `BAD_ARGUMENTS`.
 const BAD_ARGUMENTS = 36;
@@ -125,8 +125,20 @@ export function makeIo(env: Env, background: (promise: Promise<unknown>) => void
 			cacheRange(key, data);
 			return data;
 		},
-		runShard(index: number, request: ShardRequest): Promise<ShardAnswer> {
-			return engineHost(env.ENGINE_HOST, `shard-${index}`, env.LOCATION_HINT).shard(request);
+		/// The fan-out asks for its shards in one go, before any answers, so they all see the same order.
+		async runShard(index: number, request: ShardRequest): Promise<ShardAnswer> {
+			const object = shardObjects(env)[index]!;
+			let answer: ShardAnswer;
+			try {
+				answer = await engineHost(env.ENGINE_HOST, `shard-${object}`, env.LOCATION_HINT).shard(request);
+			} catch (error) {
+				shard_cold_at.set(object, Date.now());
+				throw error;
+			}
+			if (answer.cold) {
+				shard_cold_at.set(object, Date.now());
+			}
+			return answer;
 		},
 		async scheduleMerge(message: MergeMessage) {
 			await env.MERGES.send(message);
@@ -180,10 +192,18 @@ export async function runQuery(env: Env, io: Io, request: QueryRequest): Promise
 	return result.ok ? { ok: true, body: result.body, timing } : { ok: false, code: result.code, message: result.message, timing };
 }
 
-/// Starts the engines of the shards.
+/// There are twice as many shard objects as a fan-out uses, and the coordinator uses those that have answered warm
+/// lately, see `preferWarm`. `shard_cold_at` is when each last answered with a new engine, in this isolate.
+const shard_cold_at = new Map<number, number>();
+
+function shardObjects(env: Env): number[] {
+	return preferWarm(2 * limits(env).maxShards, shard_cold_at);
+}
+
+/// Starts the engines of the shards that the next fan-out will use.
 function warmShards(env: Env): Promise<unknown> {
-	const shards = limits(env).maxShards;
-	return Promise.allSettled(Array.from({ length: shards }, (_, i) => engineHost(env.ENGINE_HOST, `shard-${i}`, env.LOCATION_HINT).warm()));
+	const objects = shardObjects(env).slice(0, limits(env).maxShards);
+	return Promise.allSettled(objects.map((object) => engineHost(env.ENGINE_HOST, `shard-${object}`, env.LOCATION_HINT).warm()));
 }
 
 export async function runWarm(env: Env): Promise<void> {
@@ -191,7 +211,8 @@ export async function runWarm(env: Env): Promise<void> {
 }
 
 export async function runShard(env: Env, io: Io, request: ShardRequest): Promise<ShardAnswer> {
-	return withDatabase(env, (db) => db.shard(request, io));
+	const cold = database === undefined;
+	return { ...(await withDatabase(env, (db) => db.shard(request, io))), cold };
 }
 
 export async function runMerge(env: Env, io: Io, message: MergeMessage): Promise<number> {

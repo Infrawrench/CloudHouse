@@ -26,8 +26,9 @@ export interface Limits {
 	mergeParts: number;
 	/// A commit that leaves a table with this many parts schedules a merge.
 	mergeThreshold: number;
-	/// A shard that has not answered when half of the shards have, after twice their time and at least this many
-	/// milliseconds, is most likely an engine that is starting: the coordinator runs its part of the query too.
+	/// A shard that has not answered after three times the time that half of the shards took, and at least this many
+	/// milliseconds, is most likely an engine that is starting: the coordinator runs its part of the query too. Warm
+	/// shards differ by up to a second among themselves, and the coordinator's part takes its CPU, so not sooner.
 	hedgeMs: number;
 }
 
@@ -39,7 +40,7 @@ export const DEFAULT_LIMITS: Limits = {
 	mergeBytes: 4 * 1024 * 1024,
 	mergeParts: 10,
 	mergeThreshold: 8,
-	hedgeMs: 300,
+	hedgeMs: 1500,
 };
 
 /// The query of one shard of a fan-out: the coordinator ran its query against catalog `version`, and the shard reads
@@ -53,7 +54,8 @@ export interface ShardRequest {
 	query: string;
 }
 
-export type ShardAnswer = { ok: true; data: Uint8Array } | { ok: false; stale: boolean; message: string };
+/// `cold` if the shard started its engine for the query.
+export type ShardAnswer = ({ ok: true; data: Uint8Array } | { ok: false; stale: boolean; message: string }) & { cold?: boolean };
 
 /// A merge to run in the background: of the smallest parts, or of all of them in groups to apply the TTL.
 export interface MergeMessage {
@@ -410,7 +412,7 @@ export class Database {
 		}
 		/// With one shard, `half` is all of them.
 		if (pending.size > 0) {
-			const deadline = start + Math.max(this.limits.hedgeMs, 2 * (Date.now() - start));
+			const deadline = start + Math.max(this.limits.hedgeMs, 3 * (Date.now() - start));
 			while (pending.size > 0 && Date.now() < deadline) {
 				let timer = 0;
 				await Promise.race([changed.promise, new Promise<void>((resolve) => (timer = setTimeout(resolve, deadline - Date.now())))]);

@@ -2,6 +2,7 @@ import { SELF, createExecutionContext, createMessageBatch, getQueueResult, runDu
 import { env, exports } from "cloudflare:workers";
 import worker from "../src/index";
 import { Catalog } from "../src/catalog";
+import { preferWarm } from "../src/pool";
 import { describe, expect, it } from "vitest";
 
 const authorization = { Authorization: "Bearer test-token" };
@@ -200,5 +201,19 @@ describe("engine", () => {
 		expect(result.status).toBe(500);
 		expect(result.code).toBe("60");
 		expect(result.text).toContain("UNKNOWN_TABLE");
+	});
+});
+
+describe("preferWarm", () => {
+	it("puts the objects that came back cold lately last", () => {
+		const now = 1_000_000_000;
+		const cold_at = new Map([
+			[1, now - 60_000],
+			[3, now - 5_000],
+			/// Long enough ago to be tried again.
+			[4, now - 60 * 60 * 1000],
+		]);
+		expect(preferWarm(6, cold_at, now)).toEqual([0, 2, 4, 5, 1, 3]);
+		expect(preferWarm(3, new Map(), now)).toEqual([0, 1, 2]);
 	});
 });
