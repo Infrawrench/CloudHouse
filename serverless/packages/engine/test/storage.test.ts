@@ -150,6 +150,37 @@ describe("ObjectMergeTree", () => {
 		expect(shards.count).toBeGreaterThan(0);
 	});
 
+	it("fans out a join whose leftmost table is split, and only then", async () => {
+		const { databases, run, shards } = await cluster(4, { shardBytes: 1, maxShards: 3 });
+		const [a] = databases;
+		const reference = await cluster(1);
+		const r = reference.databases[0]!;
+		for (const [target, engine] of [[a!, "ObjectMergeTree ORDER BY k"], [r, "Memory"]] as const) {
+			const go = target === r ? reference.run : run;
+			await go(target, `CREATE TABLE f (k UInt8, v UInt64) ENGINE = ${engine}`);
+			await go(target, `CREATE TABLE d (k UInt8, name String) ENGINE = ${engine}`);
+			await go(target, "INSERT INTO d VALUES (0, 'zero'), (1, 'one'), (2, 'two'), (9, 'nine')");
+			for (let i = 0; i < 4; ++i) {
+				await go(target, `INSERT INTO f SELECT number % 5, number FROM numbers(${i * 100}, 100)`);
+			}
+		}
+		const check = async (query: string, fans: boolean) => {
+			shards.count = 0;
+			expect(await run(a!, query), query).toBe(await reference.run(r, query));
+			expect(shards.count > 0, query).toBe(fans);
+		};
+		await check("SELECT d.name, count(), sum(f.v) FROM f INNER JOIN d ON f.k = d.k GROUP BY d.name ORDER BY d.name", true);
+		await check("SELECT f.k, d.name, count() FROM f LEFT JOIN d ON f.k = d.k GROUP BY f.k, d.name ORDER BY f.k", true);
+		await check("SELECT f.v, d.name FROM f INNER JOIN d ON f.k = d.k WHERE f.v % 37 = 0 ORDER BY f.v", true);
+		/// The rows of `d` that no row matches would come back from every shard.
+		await check("SELECT d.name, count(f.v) FROM f RIGHT JOIN d ON f.k = d.k GROUP BY d.name ORDER BY d.name", false);
+		/// A shard sees only its parts of `f`, so a query that reads `f` twice in its join tree reads it here.
+		await check("SELECT count() FROM f AS x INNER JOIN f AS y ON x.v = y.v", false);
+		/// An `IN (SELECT ...)` subquery runs on its own, so its own read of `f` may split. The outer read of `f` does
+		/// not, and the answer is still the one of a single engine.
+		await check("SELECT count() FROM f WHERE v IN (SELECT max(v) FROM f GROUP BY k)", true);
+	});
+
 	it("fails a query whose shards send back too much", async () => {
 		const { databases: [a], run, fail } = await cluster(3, { shardBytes: 1, maxShards: 2 });
 		await run(a!, "CREATE TABLE w (k UInt64, s String) ENGINE = ObjectMergeTree ORDER BY k");

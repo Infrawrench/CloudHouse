@@ -2,6 +2,8 @@
 #include "ObjectPart.h"
 
 #include <Analyzer/AggregationUtils.h>
+#include <Analyzer/JoinNode.h>
+#include <Analyzer/Utils.h>
 #include <Analyzer/QueryNode.h>
 #include <Columns/ColumnConst.h>
 #include <Analyzer/TableNode.h>
@@ -110,6 +112,42 @@ namespace ErrorCodes
 
 namespace
 {
+
+/// How many times `tree` reads the table `table_id`, anywhere: in its joins, its subqueries, its `IN`s.
+size_t countTableReferences(const QueryTreeNodePtr & tree, const StorageID & table_id)
+{
+    size_t count = 0;
+    std::vector<const IQueryTreeNode *> stack{tree.get()};
+    while (!stack.empty())
+    {
+        const auto * node = stack.back();
+        stack.pop_back();
+        if (!node)
+            continue;
+        if (const auto * table = node->as<TableNode>(); table && table->getStorageID() == table_id)
+            ++count;
+        for (const auto & child : node->getChildren())
+            stack.push_back(child.get());
+    }
+    return count;
+}
+
+/// Whether the joins of `join_tree` give the same rows when its leftmost table is split among shards, each of which
+/// joins its rows with the whole of the other side: `INNER`, `LEFT` and cross joins do; `RIGHT` and `FULL` would add
+/// the rows of the other side that no row of a shard matches once per shard, and `PASTE` pairs rows by position.
+bool joinsSplitByLeftTable(const QueryTreeNodePtr & join_tree)
+{
+    const IQueryTreeNode * node = join_tree.get();
+    while (const auto * join = node->as<JoinNode>())
+    {
+        const auto kind = join->getKind();
+        if (kind != JoinKind::Inner && kind != JoinKind::Left && kind != JoinKind::Cross && kind != JoinKind::Comma)
+            return false;
+        node = join->getLeftTableExpressionNode().get();
+    }
+    /// An `ARRAY JOIN` on the way to the leftmost table is not split.
+    return node->getNodeType() == QueryTreeNodeType::TABLE;
+}
 
 /// The results of shards are this, then their blocks in the `Native` format of `revision`, not compressed: they are
 /// small, and they only travel between isolates.
@@ -502,9 +540,19 @@ public:
         const UInt64 fan_out_bytes = store.fanOutBytes(getStorageID());
         if (to_stage < QueryProcessingStage::WithMergeableState || store.isShardQuery() || fan_out_bytes == 0)
             return QueryProcessingStage::FetchColumns;
-        /// With a `JOIN` or an `ARRAY JOIN`, the other side would have to go to the shards too.
         const auto * query_node = query_info.query_tree ? query_info.query_tree->as<QueryNode>() : nullptr;
-        if (!query_node || !query_info.table_expression || query_node->getJoinTreeNode().get() != query_info.table_expression.get())
+        if (!query_node || !query_info.table_expression)
+            return QueryProcessingStage::FetchColumns;
+        /// A query that joins this table with others fans out when this table is the leftmost of its joins: the planner
+        /// then gives the whole join to this table, as it does to `Distributed`, and each shard joins its parts with the
+        /// whole of the other tables, which it reads itself. `instance_types` and the like are small; `prices` is not.
+        const auto & join_tree = query_node->getJoinTreeNode();
+        if (join_tree.get() != query_info.table_expression.get()
+            && (extractLeftTableExpression(query_node->getJoinTreeNodeTyped()).get() != query_info.table_expression.get() || !joinsSplitByLeftTable(join_tree)))
+            return QueryProcessingStage::FetchColumns;
+        /// A shard sees only its parts of this table, so a query that reads it again, in a subquery, an `IN` or on the
+        /// other side of a join, would see only those there too.
+        if (countTableReferences(query_info.query_tree, getStorageID()) != 1)
             return QueryProcessingStage::FetchColumns;
         /// A query of rows fans out too: read here, a `SELECT *` with a filter on columns outside the key read 200 MiB of
         /// parts in one engine, which took tens of seconds and could exceed the memory of the isolate. A shard sends back
@@ -1079,7 +1127,10 @@ private:
         const auto * results = store.getFanOutResults(table_id, shard_query);
         if (!results)
         {
-            store.addFanOutRequest({.database = table_id.database_name, .table = table_id.table_name, .query = shard_query});
+            const auto * query_node = query_info.query_tree ? query_info.query_tree->as<QueryNode>() : nullptr;
+            const bool joins = query_node && query_info.table_expression
+                && query_node->getJoinTreeNode().get() != query_info.table_expression.get();
+            store.addFanOutRequest({.database = table_id.database_name, .table = table_id.table_name, .query = shard_query, .joins = joins});
             throw Exception(ErrorCodes::NOT_FOUND_EXPECTED_DATA_PART, "The query on table {} fans out to shards", table_id.getNameForLogs());
         }
 

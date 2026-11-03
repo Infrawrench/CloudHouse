@@ -49,6 +49,8 @@ export interface FanOutRequest {
 	database: string;
 	table: string;
 	query: string;
+	/// The query reads other tables too, which the shards read themselves.
+	joins: boolean;
 }
 
 /// Reads and writes parts, for the engine while it runs a query: the engine announces the ranges that it is going to

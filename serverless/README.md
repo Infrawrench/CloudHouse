@@ -247,8 +247,11 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
   and finished by the engine that got it. Each shard is an `EngineHost` (`shard-<n>`) that reads about 4 MiB of the
   parts, at most 16 shards. `ObjectMergeTree` builds the query for the shards as `StorageDistributed` does, the
   shards return their blocks in `Native`, and the queries that the planner splits (aggregation, `ORDER BY ...
-  LIMIT`, `DISTINCT`) come out as on a cluster. A query that joins the table with another reads it all in one
-  engine, and a point query reads its few blocks in one engine.
+  LIMIT`, `DISTINCT`) come out as on a cluster. A query that joins the table with another also fans out when this
+  table is the leftmost of its joins and the joins are `INNER`, `LEFT` or cross: each shard joins its parts with the
+  whole of the other tables, which it reads itself, so `prices` joined with the small `instance_types` no longer
+  reads `prices` in one engine. A query that reads the table again (`IN (SELECT ...)`, a self-join) does not fan out,
+  because a shard sees only its own parts. A point query reads its few blocks in one engine.
 - **Caching.** Engines read ranges of parts through `PartCache` (`src/cache.ts`), an entrypoint of the Worker behind
   Workers Caching, which works on `workers.dev` and in front of loopback calls: a part never changes, so an engine
   reads a range from the cache of its data center if another engine there has read it. The cache keeps the ranges, not

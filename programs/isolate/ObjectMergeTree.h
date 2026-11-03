@@ -101,6 +101,8 @@ struct FanOutRequest
     String database;
     String table;
     String query;
+    /// The query reads other tables too, which the shards read themselves.
+    bool joins = false;
 };
 
 class ObjectPartStore

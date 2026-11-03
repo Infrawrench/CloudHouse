@@ -661,7 +661,7 @@ EMSCRIPTEN_KEEPALIVE int ch_isolate_fanout_requests()
             DB::writeJSONString(request.table, out, {});
             writeCString(",\"query\":", out);
             DB::writeJSONString(request.query, out, {});
-            writeCString("}\n", out);
+            writeCString(request.joins ? ",\"joins\":true}\n" : ",\"joins\":false}\n", out);
         }
         out.finalize();
     });
