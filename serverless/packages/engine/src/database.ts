@@ -52,7 +52,7 @@ export interface ShardRequest {
 	table: string;
 	parts: string[];
 	query: string;
-	/// For a query that joins the table with others, which the shard reads itself, the version of the catalog of the
+	/// For a query that reads other tables too, which the shard reads itself, the version of the catalog of the
 	/// coordinator: a shard that is behind it syncs first. Only then, as a shard that syncs waits for the lock of its
 	/// engine, and the coordinator of that engine may be waiting for shards that wait the same way.
 	version?: number;
@@ -153,7 +153,7 @@ export class Database {
 	/// which holds the lock while it waits for its shards. So a shard with the same definition runs without the lock:
 	/// it changes nothing, and the engine shows it its parts for the duration of its query only. A shard with another
 	/// definition syncs, under the lock, and it is never in the isolate of the coordinator then. Neither is a shard behind
-	/// the version of the coordinator, which syncs too when the query joins other tables (`ShardRequest.version`).
+	/// the version of the coordinator, which syncs too when the query reads other tables (`ShardRequest.version`).
 	async shard(request: ShardRequest, io: Io): Promise<ShardAnswer> {
 		const key = tableKey(request.database, request.table);
 		const same = () => this.state.tables.get(key)?.createQuery === request.createQuery;
@@ -381,7 +381,7 @@ export class Database {
 			table: table.table,
 			parts,
 			query: request.query,
-			...(request.joins ? { version: this.state.version } : {}),
+			...(request.otherTables ? { version: this.state.version } : {}),
 		}));
 		const answers = await this.runShards(requests, io, timings);
 		timings.shards = (timings.shards ?? 0) + groups.length;

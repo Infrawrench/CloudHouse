@@ -113,39 +113,26 @@ namespace ErrorCodes
 namespace
 {
 
-/// How many times `tree` reads the table `table_id`, anywhere: in its joins, its subqueries, its `IN`s.
-size_t countTableReferences(const QueryTreeNodePtr & tree, const StorageID & table_id)
-{
-    size_t count = 0;
-    std::vector<const IQueryTreeNode *> stack{tree.get()};
-    while (!stack.empty())
-    {
-        const auto * node = stack.back();
-        stack.pop_back();
-        if (!node)
-            continue;
-        if (const auto * table = node->as<TableNode>(); table && table->getStorageID() == table_id)
-            ++count;
-        for (const auto & child : node->getChildren())
-            stack.push_back(child.get());
-    }
-    return count;
-}
-
 /// Whether the joins of `join_tree` give the same rows when its leftmost table is split among shards, each of which
-/// joins its rows with the whole of the other side: `INNER`, `LEFT` and cross joins do; `RIGHT` and `FULL` would add
-/// the rows of the other side that no row of a shard matches once per shard, and `PASTE` pairs rows by position.
+/// joins its rows with the whole of the other side: `INNER` and `LEFT` joins, each row of the left side on its own, do.
+/// `RIGHT` and `FULL` would add the rows of the other side that no row of a shard matches once per shard, `PASTE` pairs
+/// rows by position, and `ANY INNER` uses each key of the other side once, which would be once per shard. A `CROSS JOIN`
+/// is a node of its own, and an `ARRAY JOIN` on the way to the leftmost table is not split: neither is a `JoinNode`.
 bool joinsSplitByLeftTable(const QueryTreeNodePtr & join_tree)
 {
     const IQueryTreeNode * node = join_tree.get();
     while (const auto * join = node->as<JoinNode>())
     {
         const auto kind = join->getKind();
-        if (kind != JoinKind::Inner && kind != JoinKind::Left && kind != JoinKind::Cross && kind != JoinKind::Comma)
+        const auto strictness = join->getStrictness();
+        if (kind != JoinKind::Inner && kind != JoinKind::Left)
+            return false;
+        if (strictness == JoinStrictness::Unspecified)
+            return false;
+        if (kind == JoinKind::Inner && (strictness == JoinStrictness::Any || strictness == JoinStrictness::RightAny))
             return false;
         node = join->getLeftTableExpressionNode().get();
     }
-    /// An `ARRAY JOIN` on the way to the leftmost table is not split.
     return node->getNodeType() == QueryTreeNodeType::TABLE;
 }
 
@@ -551,8 +538,10 @@ public:
             && (extractLeftTableExpression(query_node->getJoinTreeNodeTyped()).get() != query_info.table_expression.get() || !joinsSplitByLeftTable(join_tree)))
             return QueryProcessingStage::FetchColumns;
         /// A shard sees only its parts of this table, so a query that reads it again, in a subquery, an `IN` or on the
-        /// other side of a join, would see only those there too.
-        if (countTableReferences(query_info.query_tree, getStorageID()) != 1)
+        /// other side of a join, would see only those there too. And the other tables that a query reads have to be there
+        /// on a shard: a table of `Memory` or a view belongs to one engine.
+        const auto tables = tablesRead(query_info.query_tree, getStorageID());
+        if (tables.this_table != 1 || !tables.others_on_shards)
             return QueryProcessingStage::FetchColumns;
         /// A query of rows fans out too: read here, a `SELECT *` with a filter on columns outside the key read 200 MiB of
         /// parts in one engine, which took tens of seconds and could exceed the memory of the isolate. A shard sends back
@@ -1093,6 +1082,48 @@ private:
         return true;
     }
 
+    struct TablesRead
+    {
+        size_t this_table = 0;
+        size_t others = 0;
+        /// All the others are tables of the catalog, which every shard has.
+        bool others_on_shards = true;
+    };
+
+    /// The tables that `tree` reads, anywhere: in its joins, its subqueries, its `IN`s.
+    static TablesRead tablesRead(const QueryTreeNodePtr & tree, const StorageID & table_id)
+    {
+        TablesRead tables;
+        std::vector<const IQueryTreeNode *> stack{tree.get()};
+        while (!stack.empty())
+        {
+            const auto * node = stack.back();
+            stack.pop_back();
+            if (!node)
+                continue;
+            if (const auto * table = node->as<TableNode>())
+            {
+                if (table->getStorageID() == table_id)
+                {
+                    ++tables.this_table;
+                }
+                else
+                {
+                    ++tables.others;
+                    tables.others_on_shards &= typeid_cast<const StorageObjectMergeTree *>(table->getStorage().get()) != nullptr;
+                }
+            }
+            else if (node->getNodeType() == QueryTreeNodeType::TABLE_FUNCTION)
+            {
+                ++tables.others;
+                tables.others_on_shards = false;
+            }
+            for (const auto & child : node->getChildren())
+                stack.push_back(child.get());
+        }
+        return tables;
+    }
+
     /// As `StorageDistributed::read`: the query for the shards is the query tree with the table in it, and their
     /// results come back at `processed_stage`, one stream per shard, for the planner to merge.
     void readFromShards(
@@ -1127,10 +1158,8 @@ private:
         const auto * results = store.getFanOutResults(table_id, shard_query);
         if (!results)
         {
-            const auto * query_node = query_info.query_tree ? query_info.query_tree->as<QueryNode>() : nullptr;
-            const bool joins = query_node && query_info.table_expression
-                && query_node->getJoinTreeNode().get() != query_info.table_expression.get();
-            store.addFanOutRequest({.database = table_id.database_name, .table = table_id.table_name, .query = shard_query, .joins = joins});
+            const bool other_tables = tablesRead(query_info.query_tree, table_id).others != 0;
+            store.addFanOutRequest({.database = table_id.database_name, .table = table_id.table_name, .query = shard_query, .other_tables = other_tables});
             throw Exception(ErrorCodes::NOT_FOUND_EXPECTED_DATA_PART, "The query on table {} fans out to shards", table_id.getNameForLogs());
         }
 

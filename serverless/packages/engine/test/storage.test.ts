@@ -159,26 +159,55 @@ describe("ObjectMergeTree", () => {
 			const go = target === r ? reference.run : run;
 			await go(target, `CREATE TABLE f (k UInt8, v UInt64) ENGINE = ${engine}`);
 			await go(target, `CREATE TABLE d (k UInt8, name String) ENGINE = ${engine}`);
+			await go(target, "CREATE TABLE m (k UInt8, label String) ENGINE = Memory");
+			await go(target, "INSERT INTO m VALUES (0, 'm0'), (1, 'm1')");
 			await go(target, "INSERT INTO d VALUES (0, 'zero'), (1, 'one'), (2, 'two'), (9, 'nine')");
 			for (let i = 0; i < 4; ++i) {
 				await go(target, `INSERT INTO f SELECT number % 5, number FROM numbers(${i * 100}, 100)`);
 			}
+			await go(target, "CREATE VIEW vf AS SELECT k, v FROM f");
 		}
-		const check = async (query: string, fans: boolean) => {
+		/// `count` is how many shards the query ran on: 3 for one fan-out of `f`, 0 if it read `f` here.
+		const check = async (query: string, count: number) => {
 			shards.count = 0;
 			expect(await run(a!, query), query).toBe(await reference.run(r, query));
-			expect(shards.count > 0, query).toBe(fans);
+			expect(shards.count, query).toBe(count);
 		};
-		await check("SELECT d.name, count(), sum(f.v) FROM f INNER JOIN d ON f.k = d.k GROUP BY d.name ORDER BY d.name", true);
-		await check("SELECT f.k, d.name, count() FROM f LEFT JOIN d ON f.k = d.k GROUP BY f.k, d.name ORDER BY f.k", true);
-		await check("SELECT f.v, d.name FROM f INNER JOIN d ON f.k = d.k WHERE f.v % 37 = 0 ORDER BY f.v", true);
+		await check("SELECT d.name, count(), sum(f.v) FROM f INNER JOIN d ON f.k = d.k GROUP BY d.name ORDER BY d.name", 3);
+		await check("SELECT f.k, d.name, count() FROM f LEFT JOIN d ON f.k = d.k GROUP BY f.k, d.name ORDER BY f.k", 3);
+		await check("SELECT f.v, d.name FROM f INNER JOIN d ON f.k = d.k WHERE f.v % 37 = 0 ORDER BY f.v", 3);
+		await check("SELECT count() FROM f ANY LEFT JOIN d ON f.k = d.k", 3);
+		await check("SELECT count() FROM f SEMI LEFT JOIN d ON f.k = d.k", 3);
+		await check("SELECT count() FROM f ANTI LEFT JOIN d ON f.k = d.k", 3);
+		await check("SELECT count() FROM f, d WHERE f.k = d.k", 3);
+		await check("SELECT s.n, count() FROM f INNER JOIN (SELECT k, upper(name) AS n FROM d) AS s ON f.k = s.k GROUP BY s.n ORDER BY s.n", 3);
+		await check("SELECT count() FROM f WHERE k IN (SELECT k FROM d)", 3);
 		/// The rows of `d` that no row matches would come back from every shard.
-		await check("SELECT d.name, count(f.v) FROM f RIGHT JOIN d ON f.k = d.k GROUP BY d.name ORDER BY d.name", false);
-		/// A shard sees only its parts of `f`, so a query that reads `f` twice in its join tree reads it here.
-		await check("SELECT count() FROM f AS x INNER JOIN f AS y ON x.v = y.v", false);
-		/// An `IN (SELECT ...)` subquery runs on its own, so its own read of `f` may split. The outer read of `f` does
-		/// not, and the answer is still the one of a single engine.
-		await check("SELECT count() FROM f WHERE v IN (SELECT max(v) FROM f GROUP BY k)", true);
+		await check("SELECT d.name, count(f.v) FROM f RIGHT JOIN d ON f.k = d.k GROUP BY d.name ORDER BY d.name", 0);
+		await check("SELECT count() FROM f FULL JOIN d ON f.k = d.k", 0);
+		/// Each key of `d` would be used once per shard.
+		await check("SELECT count() FROM f ANY INNER JOIN d ON f.k = d.k", 0);
+		await check("SELECT count() FROM f INNER JOIN d ON f.k = d.k SETTINGS join_default_strictness = 'ANY'", 0);
+		await check("SELECT count() FROM f CROSS JOIN d", 0);
+		/// A shard sees only its parts of `f`, so a query that reads `f` twice reads it here. Its subquery is a query of
+		/// its own, which fans out: only that one.
+		await check("SELECT count() FROM f AS x INNER JOIN f AS y ON x.v = y.v", 0);
+		await check("SELECT count() FROM f WHERE v IN (SELECT max(v) FROM f GROUP BY k)", 3);
+		await check("SELECT count() FROM f CROSS JOIN (SELECT max(v) AS m FROM f) AS s WHERE f.v = s.m", 3);
+		/// A shard does not have a table of `Memory`, a view, or what a table function reads here.
+		await check("SELECT m.label, count() FROM f INNER JOIN m ON f.k = m.k GROUP BY m.label ORDER BY m.label", 0);
+		await check("SELECT count() FROM f WHERE k IN (SELECT k FROM m)", 0);
+		await check("SELECT count() FROM f INNER JOIN vf AS x ON f.v = x.v", 3);
+		await check("SELECT count() FROM f WHERE v IN (SELECT max(v) FROM vf GROUP BY k)", 3);
+		await check("SELECT count() FROM f INNER JOIN numbers(3) AS n ON f.k = n.number", 0);
+		/// The shards are behind the coordinator for `d`, and for `e`, which they have never seen: they sync first.
+		for (const [target, go, engine] of [[a!, run, "ObjectMergeTree ORDER BY k"], [r, reference.run, "Memory"]] as const) {
+			await go(target, "INSERT INTO d VALUES (3, 'three')");
+			await go(target, `CREATE TABLE e (k UInt8) ENGINE = ${engine}`);
+			await go(target, "INSERT INTO e VALUES (4)");
+		}
+		await check("SELECT d.name, count() FROM f INNER JOIN d ON f.k = d.k GROUP BY d.name ORDER BY d.name", 3);
+		await check("SELECT count() FROM f WHERE k IN (SELECT k FROM e)", 3);
 	});
 
 	it("fails a query whose shards send back too much", async () => {
