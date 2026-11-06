@@ -51,7 +51,7 @@ async function cluster(isolates: number, limits: Partial<Limits> = {}, hooks: { 
 		if (!result.ok) {
 			throw new Error(`${query}: ${result.message}`);
 		}
-		return decoder.decode(result.body);
+		return joined(result.chunks);
 	};
 	const fail = async (database: Database, query: string) => {
 		const result = await database.query(query, "", io(databases.indexOf(database)));
@@ -70,6 +70,8 @@ async function cluster(isolates: number, limits: Partial<Limits> = {}, hooks: { 
 	const parts = async (table: string) => [...(await catalog.snapshot()).tables.values()].find((entry) => entry.table === table)!.parts;
 	return { databases, io, run, fail, merge, merges, settle, parts, reads, shards };
 }
+
+const joined = (chunks: Uint8Array[]) => chunks.map((chunk) => decoder.decode(chunk, { stream: true })).join("") + decoder.decode();
 
 /// About 1 KiB of a string that compresses to half.
 const hashes = "arrayStringConcat(arrayMap(i -> hex(sipHash64(number, i)), range(60)))";
@@ -289,7 +291,7 @@ describe("ObjectMergeTree", () => {
 		const timings: Timings = { sync: 0, load: 0, commit: 0 };
 		const result = await a!.query("SELECT k, count(), sum(v) FROM t GROUP BY k ORDER BY k", "", io(0), false, timings);
 		stuck.resolve();
-		expect(result.ok && decoder.decode(result.body)).toBe("0\t600\t898500\n1\t600\t899100\n2\t600\t899700\n3\t600\t900300\n4\t600\t900900\n");
+		expect(result.ok && joined(result.chunks)).toBe("0\t600\t898500\n1\t600\t899100\n2\t600\t899700\n3\t600\t900300\n4\t600\t900900\n");
 		expect(timings.shards).toBe(3);
 		expect(timings.hedged).toBe(1);
 	});

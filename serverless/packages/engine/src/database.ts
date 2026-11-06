@@ -1,5 +1,5 @@
 import { type Catalog, type Snapshot, type Table, tableKey } from "./catalog";
-import { type CatalogChange, type Engine, type FanOutRequest, NOT_FOUND_EXPECTED_DATA_PART, type QueryResult } from "./engine";
+import { type CatalogChange, type Engine, type FanOutRequest, NOT_FOUND_EXPECTED_DATA_PART, type QueryOutput, type QueryResult } from "./engine";
 import { chooseMerge, groupParts, partKey, shardParts } from "./parts";
 import type { QueryInput } from "./input";
 import { ReadAhead } from "./readahead";
@@ -115,7 +115,7 @@ export class Database {
 	private waiting = 0;
 	/// Why the last query ran again, if it was for an error of the engine, which a query that runs again too many
 	/// times returns.
-	private retry_reason: QueryResult | undefined;
+	private retry_reason: QueryOutput | undefined;
 
 	constructor(
 		private readonly engine: Engine,
@@ -139,7 +139,7 @@ export class Database {
 		readonly = false,
 		timings: Timings = { sync: 0, load: 0, commit: 0 },
 		input?: QueryInput,
-	): Promise<QueryResult> {
+	): Promise<QueryOutput> {
 		return this.run(query, format, io, readonly, timings, input);
 	}
 
@@ -235,7 +235,7 @@ export class Database {
 
 	/// A query runs in the engine under the lock. If it only adds or replaces parts, which the engine does not show
 	/// until they are committed, the lock is released for the upload and the commit, and other queries run meanwhile.
-	private async run(query: string | Uint8Array, format: string, io: Io, readonly: boolean, timings: Timings, input?: QueryInput): Promise<QueryResult> {
+	private async run(query: string | Uint8Array, format: string, io: Io, readonly: boolean, timings: Timings, input?: QueryInput): Promise<QueryOutput> {
 		this.retry_reason = undefined;
 		for (let attempt = 1; ; ++attempt) {
 			const step = await this.exclusive("query", () => this.prepare(query, format, io, readonly, timings, input));
@@ -305,7 +305,7 @@ export class Database {
 		io: Io,
 		written: string[],
 		input?: QueryInput,
-	): Promise<QueryResult | "stale"> {
+	): Promise<QueryOutput | "stale"> {
 		/// The time the engine waits for parts, which is less than the time the reads take, as they overlap.
 		const read_ahead = new ReadAhead((part, offset, size) => io.readRange(part, offset, size));
 		const reader = {
@@ -808,9 +808,9 @@ export interface EngineLoad {
 
 /// What a query that ran in the engine leaves to do.
 type Step =
-	| { kind: "done"; result: QueryResult }
+	| { kind: "done"; result: QueryOutput }
 	| { kind: "retry" }
-	| { kind: "commit"; snapshot: Snapshot; changes: CatalogChange[]; written: string[]; result: QueryResult };
+	| { kind: "commit"; snapshot: Snapshot; changes: CatalogChange[]; written: string[]; result: QueryOutput };
 
 function sameParts(a: readonly string[], b: readonly string[]): boolean {
 	return a.length === b.length && a.every((part, i) => part === b[i]);

@@ -3,8 +3,36 @@
 
 /// The answer to a query, as plain data, so that it can come back from an `EngineHost` over RPC.
 export type Answer =
-	| { ok: true; body: Uint8Array; timing: string }
+	| { ok: true; body: Uint8Array | ReadableStream<Uint8Array>; timing: string }
 	| { ok: false; code: number; message: string; timing: string };
+
+/// A small result goes whole. A large one goes as a stream, which lets go of each piece as it is sent: as one array, it
+/// would be in the memory of the isolate twice, with the copy that goes over RPC.
+const STREAM_ABOVE_BYTES = 1024 * 1024;
+
+export function answerBody(chunks: Uint8Array[]): Uint8Array | ReadableStream<Uint8Array> {
+	const bytes = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+	if (bytes <= STREAM_ABOVE_BYTES) {
+		const body = new Uint8Array(bytes);
+		let offset = 0;
+		for (const chunk of chunks) {
+			body.set(chunk, offset);
+			offset += chunk.length;
+		}
+		return body;
+	}
+	return new ReadableStream({
+		type: "bytes",
+		pull(controller) {
+			const chunk = chunks.shift();
+			if (chunk === undefined) {
+				controller.close();
+			} else {
+				controller.enqueue(chunk);
+			}
+		},
+	});
+}
 
 /// A query as the HTTP interface gets it, for an engine. The body is a stream, which can go over RPC without a limit of
 /// size, and which the engine reads as it runs the query.

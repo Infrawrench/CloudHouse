@@ -5,6 +5,11 @@ import type { InputReader } from "./input";
 
 /// The outcome of a query: its output, or the message of the exception and its code.
 export type QueryResult = { ok: true; body: Uint8Array } | { ok: false; code: number; message: string };
+/// A query's output is kept as the pieces that the engine gave, which go as they are sent. See `HostOutputWriteBuffer`.
+export type QueryOutput = { ok: true; chunks: Uint8Array[] } | { ok: false; code: number; message: string };
+
+/// The most output of a query that this keeps. It is in the memory of the isolate, beside the engine, until it is sent.
+export const MAX_OUTPUT_BYTES = 24 * 1024 * 1024;
 
 /// The code of the exception of a query on a table that fans out, before the shards have run, see `ObjectMergeTree.h`.
 export const NOT_FOUND_EXPECTED_DATA_PART = 230;
@@ -81,6 +86,8 @@ export class Engine {
 	private queue: Promise<unknown> = Promise.resolve();
 	/// How the query that runs reads parts.
 	private reader: PartIo | undefined;
+	/// The output of the query that runs.
+	private output: { chunks: Uint8Array[]; bytes: number } | undefined;
 	/// The body of the request of the query that runs.
 	private input: InputReader | undefined;
 
@@ -114,6 +121,9 @@ export class Engine {
 				writePart(part, data) {
 					return engine!.currentReader(part).writePart(part, data);
 				},
+				writeOutput(data) {
+					engine!.keepOutput(data);
+				},
 				readInput(size) {
 					if (engine!.input === undefined) {
 						throw new Error("The engine reads the body of a query that has none");
@@ -137,8 +147,10 @@ export class Engine {
 		readonly: boolean,
 		reader: PartIo,
 		input?: { reader: InputReader; encoding: string },
-	): Promise<QueryResult> {
+	): Promise<QueryOutput> {
 		return this.exclusive(async () => {
+			const chunks: Uint8Array[] = [];
+			this.output = { chunks, bytes: 0 };
 			this.input = input?.reader;
 			const code = await this.callAsync(
 				(q, f, e) => this.module._ch_isolate_query(q[0], q[1], f[0], f[1], readonly ? 1 : 0, input ? 1 : 0, e[0], e[1]),
@@ -148,9 +160,9 @@ export class Engine {
 				input?.encoding ?? "",
 			).finally(() => {
 				this.input = undefined;
+				this.output = undefined;
 			});
-			const body = this.takeResult();
-			return code === 0 ? { ok: true, body } : { ok: false, code, message: decoder.decode(body) };
+			return code === 0 ? { ok: true, chunks } : { ok: false, code, message: decoder.decode(this.takeResult()) };
 		});
 	}
 
@@ -227,6 +239,18 @@ export class Engine {
 	/// The size of the linear memory, which only grows.
 	get memoryBytes(): number {
 		return this.module.HEAPU8.length;
+	}
+
+	/// A query of the host, which brings the engine up to date, has no output to keep.
+	private keepOutput(data: Uint8Array): void {
+		if (this.output === undefined) {
+			return;
+		}
+		this.output.bytes += data.length;
+		if (this.output.bytes > MAX_OUTPUT_BYTES) {
+			throw new Error(`The result of the query is more than ${MAX_OUTPUT_BYTES / 1024 / 1024} MiB: aggregate the rows, filter them more, or add a LIMIT`);
+		}
+		this.output.chunks.push(data);
 	}
 
 	private async exclusive<T>(f: () => Promise<T>): Promise<T> {

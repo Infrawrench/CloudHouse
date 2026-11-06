@@ -70,6 +70,7 @@ namespace fs = std::filesystem;
 /// Imported from the host (`host.js`): copies up to `size` bytes of the body of the request of the query to `dest`,
 /// and returns how many, 0 at its end. The engine waits for them (JSPI).
 extern "C" size_t ch_host_read_input(char * dest, size_t size);
+extern "C" int ch_host_write_output(const char * data, size_t size);
 
 namespace DB
 {
@@ -335,6 +336,22 @@ private:
 
 /// Runs a query, as the HTTP interface does: its text is `query`, then the body of the request if `with_input`,
 /// which is compressed with `input_encoding` (`Content-Encoding`: `gzip`, `zstd`, ...), or not if it is empty.
+/// The output of a query, which goes to the host as it comes. The linear memory never shrinks, where the host's does: in
+/// a string here, a result of 10 MiB grew the engine by 30 MiB for good, and one of 20 MiB failed with `std::bad_alloc`.
+class HostOutputWriteBuffer final : public BufferWithOwnMemory<WriteBuffer>
+{
+public:
+    HostOutputWriteBuffer() : BufferWithOwnMemory<WriteBuffer>(256 * 1024) {}
+
+private:
+    void nextImpl() override
+    {
+        /// The host refuses only an output over its limit.
+        if (offset() != 0 && ch_host_write_output(working_buffer.begin(), offset()) != 0)
+            throw Exception(ErrorCodes::TOO_MANY_ROWS_OR_BYTES, "{}", takeHostError());
+    }
+};
+
 void runQuery(std::string_view query, std::string_view default_format, bool readonly, bool with_input, std::string_view input_encoding)
 {
     auto context = makeQueryContext(readonly);
@@ -349,9 +366,17 @@ void runQuery(std::string_view query, std::string_view default_format, bool read
         buffers.push_back(wrapReadBufferWithCompressionMethod(
             std::make_unique<HostInputReadBuffer>(), chooseCompressionMethod({}, String{input_encoding})));
     ConcatReadBuffer in(std::move(buffers));
-    WriteBufferFromString out(result);
-    executeQuery(in, out, context, /* set_result_details= */ {});
-    out.finalize();
+    HostOutputWriteBuffer out;
+    try
+    {
+        executeQuery(in, out, context, /* set_result_details= */ {});
+        out.finalize();
+    }
+    catch (...)
+    {
+        out.cancel();
+        throw;
+    }
 }
 
 /// Runs the query of a shard up to `WithMergeableState` on `parts` of a table, and makes its result the blocks it

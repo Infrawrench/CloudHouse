@@ -4,7 +4,7 @@ import { pendingWaits, READ_DEADLINE_MS, SHARD_DEADLINE_MS, withDeadline } from 
 import { DEFAULT_LIMITS, Database, type EngineLoad, type Io, type Limits, type MergeMessage, type ShardRequest, type Timings } from "./database";
 import { Engine } from "./engine";
 import type { Env } from "./env";
-import type { Answer, QueryRequest } from "./http";
+import { answerBody, type Answer, type QueryRequest } from "./http";
 import { bufferedInput, MAX_QUERY_BODY, type QueryInput, readAll, streamedInput } from "./input";
 import { engineHost, preferWarm } from "./pool";
 
@@ -225,7 +225,7 @@ export async function runQuery(env: Env, io: Io, request: QueryRequest): Promise
 		`kib;dur=${Math.round(io.stats.bytes / 1024)}`,
 		...(timings.shards ? [`shards;dur=${timings.shards}`, `slowest_shard;dur=${timings.slowest_shard}`, `hedged;dur=${timings.hedged ?? 0}`] : []),
 	].join(", ");
-	return result.ok ? { ok: true, body: result.body, timing } : { ok: false, code: result.code, message: result.message, timing };
+	return result.ok ? { ok: true, body: answerBody(result.chunks), timing } : { ok: false, code: result.code, message: result.message, timing };
 }
 
 /// There are twice as many shard objects as a fan-out uses, and the coordinator uses those that have answered warm

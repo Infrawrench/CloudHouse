@@ -8,7 +8,7 @@ import { askPool, engineHost, poolSize } from "./pool";
 
 /// The catalog lives in a Durable Object of this Worker, and so do the engines of the pool.
 export { Coordination } from "coordination";
-export { Engine, type QueryResult } from "./engine";
+export { Engine, type QueryOutput, type QueryResult } from "./engine";
 export type { Env } from "./env";
 export { PartCache } from "./cache";
 export { EngineHost } from "./host";

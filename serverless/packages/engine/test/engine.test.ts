@@ -4,6 +4,7 @@ import worker from "../src/index";
 import { Catalog } from "../src/catalog";
 import { DeadlineExceeded, pendingWaits, withDeadline } from "../src/deadline";
 import { STUCK_MS, stuckCall } from "../src/host";
+import { answerBody } from "../src/http";
 import { leastBusy, pickTwo, preferWarm, stalled } from "../src/pool";
 import { describe, expect, it } from "vitest";
 
@@ -203,6 +204,42 @@ describe("engine", () => {
 		expect(result.status).toBe(500);
 		expect(result.code).toBe("60");
 		expect(result.text).toContain("UNKNOWN_TABLE");
+	});
+});
+
+describe("output of a query", () => {
+	const rows = (mib: number) => `SELECT number, repeat('x', 92) FROM numbers(${mib * 10240})`;
+	const send = (sql: string) => SELF.fetch("http://engine/", { method: "POST", body: sql, headers: authorization });
+	const memory = (response: Response) => Number(response.headers.get("Server-Timing")?.match(/memory;dur=(\d+)/)?.[1]);
+
+	it("goes to the host, not into the memory of the engine, and arrives whole", async () => {
+		const first = await send("SELECT 1");
+		await first.text();
+		const response = await send(rows(20));
+		const lines = (await response.text()).split("\n");
+		expect(response.status).toBe(200);
+		expect(lines.length).toBe(20 * 10240 + 1);
+		expect(lines[0]).toBe(`0\t${"x".repeat(92)}`);
+		expect(lines[20 * 10240 - 1]).toBe(`${20 * 10240 - 1}\t${"x".repeat(92)}`);
+		/// In a string in the engine, 10 MiB of output grew it by 30 MiB.
+		expect(memory(response)).toBeLessThanOrEqual(memory(first));
+	});
+
+	it("gives a small result whole, and a large one as a stream", async () => {
+		expect(answerBody([new Uint8Array([1, 2]), new Uint8Array([3])])).toEqual(new Uint8Array([1, 2, 3]));
+		const large = answerBody([new Uint8Array(2 * 1024 * 1024).fill(7), new Uint8Array([8])]);
+		expect(large).toBeInstanceOf(ReadableStream);
+		const bytes = new Uint8Array(await new Response(large).arrayBuffer());
+		expect(bytes.length).toBe(2 * 1024 * 1024 + 1);
+		expect(bytes[bytes.length - 1]).toBe(8);
+	});
+
+	it("fails over the limit, with status 500 and no partial result", async () => {
+		const response = await send(rows(30));
+		expect(response.status).toBe(500);
+		expect(response.headers.get("X-ClickHouse-Exception-Code")).toBe("396");
+		expect(await response.text()).toMatch(/The result of the query is more than 24 MiB/);
+		expect(await (await send("SELECT 1")).text()).toBe("1\n");
 	});
 });
 

@@ -46,6 +46,7 @@ declare module "*/clickhouse-isolate.mjs" {
 			prefetch(part: string, offset: number, size: number): void;
 			writePart(part: string, data: Uint8Array): Promise<void>;
 			readInput(size: number): Promise<Uint8Array>;
+			writeOutput(data: Uint8Array): void;
 		};
 	}
 

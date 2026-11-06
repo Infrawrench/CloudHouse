@@ -77,6 +77,20 @@ addToLibrary({
     }
   },
 
+  // int ch_host_write_output(const char * data, size_t size)
+  // The next bytes of the output of the query, which the host keeps. -1 if it has too much.
+  ch_host_write_output__deps: ["$hostError"],
+  ch_host_write_output__sig: "ipp",
+  ch_host_write_output: function (data, size) {
+    try {
+      Module.host.writeOutput(HEAPU8.slice(Number(data), Number(data) + Number(size)));
+      return 0;
+    } catch (error) {
+      hostError = error instanceof Error ? error.message : String(error);
+      return -1;
+    }
+  },
+
   // void ch_host_prefetch(const char * part, size_t part_size, size_t offset, size_t size)
   ch_host_prefetch__sig: "vpppp",
   ch_host_prefetch: function (part, part_size, offset, size) {

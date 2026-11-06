@@ -276,7 +276,11 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
   been used has an alarm that often, which syncs its engine and keeps the object from being evicted, until it has
   had no use for a day. It costs the time of 24 objects in Durable Objects, about $10 to $15 a month.
 - **Memory.** A query can use up to 56 MiB of the memory of an engine, and the engine 60 MiB in all, with the
-  indexes of parts that it caches (8 MiB at most); a query fails with `MEMORY_LIMIT_EXCEEDED` beyond that. Reads and merges stream, so this limits the state of a query (a hash table of `GROUP BY`, a sort, the
+  indexes of parts that it caches (8 MiB at most); a query fails with `MEMORY_LIMIT_EXCEEDED` beyond that. Its output
+  goes to the Worker as it comes, in pieces of 256 KiB (`HostOutputWriteBuffer`): the linear memory never shrinks, and
+  a result of 10 MiB in it grew an engine from 48 to 79 MiB for good, and one of 20 MiB failed. The Worker keeps 24 MiB
+  at most (`MAX_OUTPUT_BYTES`), then fails the query with `TOO_MANY_ROWS_OR_BYTES`, and sends them when the query has
+  finished, so that the status of the response is right, as a stream if they are more than 1 MiB. Reads and merges stream, so this limits the state of a query (a hash table of `GROUP BY`, a sort, the
   right side of a `JOIN`), not the size of a table. A query puts each part it writes in R2 as soon as it is written,
   and holds none of them until it commits. The ranges of parts that the Worker reads ahead (6 MiB) and caches (4
   MiB), and the runs of blocks that it reads at once (2 MiB), are small, because they share the 128 MB of the
