@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { Catalog } from "../src/catalog";
+import { Catalog , DEDUPLICATION_WINDOW_MS } from "../src/catalog";
 import { DEFAULT_LIMITS, Database, type Io, type Limits, type MergeMessage, type Timings } from "../src/database";
 import { Engine } from "../src/engine";
 import { collectGarbage } from "../src/garbage";
@@ -68,7 +68,7 @@ async function cluster(isolates: number, limits: Partial<Limits> = {}, hooks: { 
 	};
 	const catalog = new Catalog(() => env.COORDINATION.get(id));
 	const parts = async (table: string) => [...(await catalog.snapshot()).tables.values()].find((entry) => entry.table === table)!.parts;
-	return { databases, io, run, fail, merge, merges, settle, parts, reads, shards };
+	return { databases, io, run, fail, merge, merges, settle, parts, reads, shards, catalog };
 }
 
 const joined = (chunks: Uint8Array[]) => chunks.map((chunk) => decoder.decode(chunk, { stream: true })).join("") + decoder.decode();
@@ -264,6 +264,61 @@ describe("ObjectMergeTree", () => {
 		shards.count = 0;
 		expect(await run(a!, "SELECT count() FROM f INNER JOIN big ON f.k = big.k WHERE big.k < 5")).toBe("5\n");
 		expect(shards.count).toBe(0);
+	}, 60_000);
+
+	it("applies an INSERT with a deduplication token once", async () => {
+		const { databases: [a, b], run, parts, settle, catalog } = await cluster(2);
+		await run(a!, "CREATE TABLE t (k UInt64) ENGINE = ObjectMergeTree PARTITION BY k % 3 ORDER BY k");
+		const insert = (token: string, table = "t") => `INSERT INTO ${table} SETTINGS insert_deduplication_token = '${token}' SELECT number FROM numbers(9)`;
+		const count = async (table = "t") => run(a!, `SELECT count() FROM ${table}`);
+		const stored = async () => (await env.PARTS.list({ prefix: "parts/" })).objects.length;
+
+		/// The same token again, from this engine or another: it succeeds, and changes nothing, with all its parts.
+		await run(a!, insert("first"));
+		expect(await count()).toBe("9\n");
+		const parts_before = (await parts("t")).sort();
+		await settle();
+		const stored_before = await stored();
+		await run(a!, insert("first"));
+		await run(b!, insert("first"));
+		await settle();
+		expect(await count()).toBe("9\n");
+		expect((await parts("t")).sort()).toEqual(parts_before);
+		expect(await stored()).toBe(stored_before);
+
+		/// Another token inserts, and so does no token, every time.
+		await run(a!, insert("second"));
+		expect(await count()).toBe("18\n");
+		const plain = "INSERT INTO t SELECT number FROM numbers(9)";
+		await run(a!, plain);
+		await run(a!, plain);
+		expect(await count()).toBe("36\n");
+
+		/// Two attempts at once: one wins.
+		await Promise.all([run(a!, insert("race")), run(b!, insert("race"))]);
+		expect(await count()).toBe("45\n");
+
+		/// The token is of the table: another table does not share it, nor the same name once it has been dropped.
+		await run(a!, "CREATE TABLE u (k UInt64) ENGINE = ObjectMergeTree ORDER BY k");
+		await run(a!, insert("first", "u"));
+		expect(await count("u")).toBe("9\n");
+		await run(a!, "DROP TABLE u");
+		await run(a!, "CREATE TABLE u (k UInt64) ENGINE = ObjectMergeTree ORDER BY k");
+		await run(a!, insert("first", "u"));
+		expect(await count("u")).toBe("9\n");
+
+		/// A merge does not forget it.
+		await run(a!, "OPTIMIZE TABLE t FINAL");
+		await run(a!, insert("first"));
+		expect(await count()).toBe("45\n");
+
+		/// The token is forgotten after the window, and not before.
+		expect(await catalog.expireDeduplication(Date.now() + DEDUPLICATION_WINDOW_MS - 60_000)).toBe(0);
+		await run(a!, insert("first"));
+		expect(await count()).toBe("45\n");
+		expect(await catalog.expireDeduplication(Date.now() + DEDUPLICATION_WINDOW_MS + 60_000)).toBeGreaterThanOrEqual(3);
+		await run(a!, insert("first"));
+		expect(await count()).toBe("54\n");
 	}, 60_000);
 
 	it("fails a query whose shards send back too much", async () => {

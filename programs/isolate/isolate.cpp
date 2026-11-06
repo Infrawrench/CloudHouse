@@ -476,6 +476,11 @@ String formatChanges()
                 writeCString(change.has_ttl ? ",\"ttl\":true" : ",\"ttl\":false", out);
                 break;
             case CatalogChange::Kind::ReplaceParts:
+                if (!change.deduplication_token.empty())
+                {
+                    writeCString(",\"deduplication_token\":", out);
+                    writeJSONString(change.deduplication_token, out, {});
+                }
                 writeCString(",\"kind\":\"replace_parts\",\"added\":", out);
                 if (!change.added.empty())
                 {

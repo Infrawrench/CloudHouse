@@ -1,4 +1,4 @@
-import { type Catalog, type Snapshot, type Table, tableKey } from "./catalog";
+import { DUPLICATE, type Catalog, type Snapshot, type Table, tableKey } from "./catalog";
 import { type CatalogChange, type Engine, type FanOutRequest, NOT_FOUND_EXPECTED_DATA_PART, type QueryOutput, type QueryResult } from "./engine";
 import { chooseMerge, groupParts, partKey, shardParts } from "./parts";
 import type { QueryInput } from "./input";
@@ -534,7 +534,7 @@ export class Database {
 	/// Commits the changes, under the lock, with `written`, the parts that the query has put in R2, which go if it
 	/// does not commit. Returns false if the catalog has moved on.
 	private async commit(changes: CatalogChange[], io: Io, written: string[]): Promise<boolean> {
-		let version: number | undefined;
+		let version: number | undefined | typeof DUPLICATE;
 		try {
 			version = await this.catalog.commit(this.state, changes);
 		} catch (error) {
@@ -542,6 +542,11 @@ export class Database {
 			this.state.version = -1;
 			io.background(this.deleteParts(written));
 			throw error;
+		}
+		if (version === DUPLICATE) {
+			await this.discardChanges();
+			io.background(this.deleteParts(written));
+			return true;
 		}
 		if (version === undefined) {
 			await this.discardChanges();
@@ -557,12 +562,17 @@ export class Database {
 	/// Commits changes of parts only, without the lock. The engine has given them up, so a commit that fails leaves
 	/// nothing to undo but `written`, the parts that the query has put in R2.
 	private async commitParts(snapshot: Snapshot, changes: CatalogChange[], written: string[], io: Io): Promise<boolean> {
-		let version: number | undefined;
+		let version: number | undefined | typeof DUPLICATE;
 		try {
 			version = await this.catalog.commit(snapshot, changes);
 		} catch (error) {
 			io.background(this.deleteParts(written));
 			throw error;
+		}
+		/// Another attempt at this `INSERT` has committed: this one succeeded too, as far as the client can tell.
+		if (version === DUPLICATE) {
+			io.background(this.deleteParts(written));
+			return true;
 		}
 		if (version === undefined) {
 			io.background(this.deleteParts(written));

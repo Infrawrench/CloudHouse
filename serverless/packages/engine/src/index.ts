@@ -25,10 +25,12 @@ export default {
 	/// deletes their expired rows.
 	async scheduled(_controller, env): Promise<void> {
 		const deleted = await collectGarbage(env);
-		const snapshot = await new Catalog(() => env.COORDINATION.get(env.COORDINATION.idFromName("catalog"))).snapshot();
+		const catalog = new Catalog(() => env.COORDINATION.get(env.COORDINATION.idFromName("catalog")));
+		const tokens = await catalog.expireDeduplication();
+		const snapshot = await catalog.snapshot();
 		const expiring = [...snapshot.tables.values()].filter((table) => table.ttl);
 		await Promise.all(expiring.map((table) => env.MERGES.send({ database: table.database, table: table.table, ttl: true })));
-		console.log(`Deleted ${deleted} parts that are not in the catalog, queued the TTL of ${expiring.length} tables`);
+		console.log(`Deleted ${deleted} parts that are not in the catalog and ${tokens} old deduplication tokens, queued the TTL of ${expiring.length} tables`);
 	},
 	/// The merges, which commits queue for the tables with too many parts, and the Cron Trigger for the TTL. Each table
 	/// has an `EngineHost` for its merges, which runs them one at a time. A consumer runs anywhere, so the object of a

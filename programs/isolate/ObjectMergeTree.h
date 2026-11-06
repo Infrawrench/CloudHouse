@@ -85,6 +85,8 @@ struct CatalogChange
     String added = {};
     UInt64 added_rows = 0;
     Strings removed = {};
+    /// `ReplaceParts`: the setting `insert_deduplication_token` of the `INSERT`, which the host commits once.
+    String deduplication_token = {};
     /// `ReplaceParts`, for the commands on partitions: parts that are detached, detached parts that are attached again,
     /// detached parts that are deleted, and parts of the table `shared_from` that the table gets too. A part never
     /// changes, so tables share it rather than copy it: it is deleted when no table has it.

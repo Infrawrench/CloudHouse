@@ -95,6 +95,7 @@ namespace Setting
     extern const SettingsBool allow_drop_detached;
     extern const SettingsBool materialize_ttl_after_modify;
     extern const SettingsUInt64 max_partitions_per_insert_block;
+    extern const SettingsString insert_deduplication_token;
 }
 
 namespace MergeTreeSetting
@@ -1029,11 +1030,12 @@ public:
 
     /// Adds the part that `writer` wrote in place of the parts `removed`. A part without rows only removes them. The
     /// host puts the part in object storage now, so that a query that writes many parts holds one at a time.
-    void addPart(ObjectPartWriter & writer, const String & partition_id, Strings removed) const
+    void addPart(ObjectPartWriter & writer, const String & partition_id, Strings removed, const String & deduplication_token = {}) const
     {
         auto & store = ObjectPartStore::instance();
         const auto table_id = getStorageID();
         CatalogChange change{.kind = CatalogChange::Kind::ReplaceParts, .database = table_id.database_name, .table = table_id.table_name, .removed = std::move(removed)};
+        change.deduplication_token = deduplication_token;
         if (writer.rows() > 0)
         {
             change.added_rows = writer.rows();
@@ -1295,7 +1297,7 @@ public:
             ObjectPartWriter writer = storage.partWriter(metadata_snapshot);
             writer.setPartition(partitionText(metadata_snapshot, rows, context));
             writer.write(rows);
-            storage.addPart(writer, partition_id, {});
+            storage.addPart(writer, partition_id, {}, context->getSettingsRef()[Setting::insert_deduplication_token].value);
         }
     }
 

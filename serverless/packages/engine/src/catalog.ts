@@ -15,8 +15,20 @@ import type { CatalogChange } from "./engine";
 /// mutations, `TRUNCATE`) does not need the catalog unchanged: only the definition of its tables, which it checks with
 /// the version of their nodes, and the parts it removes, which fail to remove if they are gone. So concurrent inserts
 /// do not conflict, and a merge only conflicts with another one of the same parts.
+///
+///   /deduplication/<table>.<token>    an `INSERT` with the setting `insert_deduplication_token` that has been committed
+///
+/// `<table>` is the `czxid` of the node of the table, so a table that is dropped and created again has no tokens, and
+/// the node is created in the transaction of the parts: whichever of two `INSERT`s with a token commits first wins, even
+/// if the client gave up on it and sent it again meanwhile. These are outside `/catalog`, which every engine reads
+/// whole. They go after `DEDUPLICATION_WINDOW_MS` (`expireDeduplication`).
 
 const ROOT = "/catalog";
+const DEDUPLICATION_ROOT = "/deduplication";
+/// Longer than any client retries for, and short enough that the tokens of a day stay few.
+export const DEDUPLICATION_WINDOW_MS = 24 * 60 * 60 * 1000;
+/// `Catalog.commit`: an `INSERT` with this token has been committed already, so this one changes nothing.
+export const DUPLICATE = "duplicate";
 
 export interface Table {
 	database: string;
@@ -52,6 +64,7 @@ const partPath = (database: string, table: string, part: string) => `${tablePath
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+const EXPIRE_BATCH = 500;
 const DETACHED = encoder.encode("detached");
 
 /// How long a session lives without requests. The catalog has no ephemeral nodes, so a session only needs to
@@ -60,6 +73,7 @@ const SESSION_TIMEOUT_MS = 60_000;
 
 export class Catalog {
 	private session: number | undefined;
+	private deduplication_root_exists = false;
 
 	/// A stub belongs to the request that made it, so every call makes one.
 	constructor(private readonly coordination: () => DurableObjectStub<Coordination>) {}
@@ -124,8 +138,9 @@ export class Catalog {
 	}
 
 	/// Commits the changes of a query that ran against `snapshot`. Returns the new version, or `undefined` if the
-	/// catalog has moved on since `snapshot`, and the query has to run again against the new catalog.
-	async commit(snapshot: Snapshot, changes: readonly CatalogChange[]): Promise<number | undefined> {
+	/// catalog has moved on since `snapshot`, and the query has to run again against the new catalog, or `DUPLICATE` if an
+	/// `INSERT` with the same token has been committed, and this one must leave nothing behind.
+	async commit(snapshot: Snapshot, changes: readonly CatalogChange[]): Promise<number | undefined | typeof DUPLICATE> {
 		const parts_only = changes.every((change) => change.kind === "replace_parts");
 		const ops: Op[] = parts_only ? [] : [{ type: "set", path: ROOT, data: new Uint8Array(), version: snapshot.version }];
 		if (parts_only) {
@@ -135,6 +150,24 @@ export class Catalog {
 					throw new Error(`The query changed the parts of ${key}, which is not in the catalog`);
 				}
 				ops.push({ type: "check", path: tablePath(table.database, table.table), version: table.definitionVersion });
+			}
+		}
+		/// The tokens come before the parts: a retry of an `INSERT` that committed says so, whatever else has changed since.
+		const token_paths = new Set<string>();
+		for (const change of changes) {
+			if (change.kind === "replace_parts" && change.deduplication_token !== undefined) {
+				const table = await this.exec({ type: "exists", path: tablePath(change.database, change.table) });
+				/// A table that has gone since the query ran: the transaction fails on its check.
+				const id = table.error === ErrorCode.ZNONODE ? "gone" : statOf(table).czxid;
+				token_paths.add(`${DEDUPLICATION_ROOT}/${id}.${encodeURIComponent(change.deduplication_token)}`);
+			}
+		}
+		const token_ops: number[] = [];
+		if (token_paths.size > 0) {
+			await this.ensureDeduplicationRoot();
+			for (const path of token_paths) {
+				token_ops.push(ops.length);
+				ops.push({ type: "create", path });
 			}
 		}
 		const databases = new Set(snapshot.databases);
@@ -261,6 +294,9 @@ export class Catalog {
 		}
 
 		const result = await this.multi(ops);
+		if (token_ops.some((index) => result.results[index]?.error === ErrorCode.ZNODEEXISTS)) {
+			return DUPLICATE;
+		}
 		if (result.error === ErrorCode.ZOK) {
 			return parts_only ? statOf(result.results[ops.length - 1]!).version : snapshot.version + 1;
 		}
@@ -271,6 +307,36 @@ export class Catalog {
 		}
 		const failed = result.results.findIndex((op) => op.error !== ErrorCode.ZOK && op.error !== ErrorCode.ZRUNTIMEINCONSISTENCY);
 		throw new Error(`Cannot commit to the catalog: error ${result.error} at ${JSON.stringify(ops[failed])}`);
+	}
+
+	/// Forgets the tokens of `INSERT`s older than `DEDUPLICATION_WINDOW_MS`. Returns how many.
+	async expireDeduplication(now: number = Date.now()): Promise<number> {
+		const tree = await this.withSession((session) => this.coordination().tree(session, DEDUPLICATION_ROOT), (result) => result.error);
+		if (tree.error === ErrorCode.ZNONODE) {
+			return 0;
+		}
+		if (tree.error !== ErrorCode.ZOK) {
+			throw new Error(`Cannot read the tokens of deduplication: error ${tree.error}`);
+		}
+		const expired = tree.nodes.filter((node) => now - node.ctime > DEDUPLICATION_WINDOW_MS).map((node) => node.path);
+		for (let i = 0; i < expired.length; i += EXPIRE_BATCH) {
+			const result = await this.multi(expired.slice(i, i + EXPIRE_BATCH).map((path) => ({ type: "remove", path })));
+			if (result.error !== ErrorCode.ZOK) {
+				throw new Error(`Cannot delete the tokens of deduplication: error ${result.error}`);
+			}
+		}
+		return expired.length;
+	}
+
+	private async ensureDeduplicationRoot(): Promise<void> {
+		if (this.deduplication_root_exists) {
+			return;
+		}
+		const created = await this.exec({ type: "create", path: DEDUPLICATION_ROOT });
+		if (created.error !== ErrorCode.ZOK && created.error !== ErrorCode.ZNODEEXISTS) {
+			throw new Error(`Cannot create the tokens of deduplication: error ${created.error}`);
+		}
+		this.deduplication_root_exists = true;
 	}
 
 	private async exec(op: Op): Promise<OpResult> {

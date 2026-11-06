@@ -129,14 +129,14 @@ export class Coordination extends DurableObject<Env> {
 		const prefix = path === "/" ? "/" : `${path}/`;
 		const end = path === "/" ? "0" : `${path}0`;
 		const nodes = this.sql
-			.exec<{ path: string; data: ArrayBuffer; version: number }>(
-				"SELECT path, data, version FROM nodes WHERE path >= ? AND path < ? ORDER BY path",
+			.exec<{ path: string; data: ArrayBuffer; version: number; ctime: number }>(
+				"SELECT path, data, version, ctime FROM nodes WHERE path >= ? AND path < ? ORDER BY path",
 				prefix,
 				end,
 			)
 			.toArray()
 			.filter((row) => row.path !== "/")
-			.map((row) => ({ path: row.path, data: new Uint8Array(row.data), version: row.version }));
+			.map((row) => ({ path: row.path, data: new Uint8Array(row.data), version: row.version, ctime: row.ctime }));
 		return { error: ErrorCode.ZOK, stat: toStat(root), nodes };
 	}
 

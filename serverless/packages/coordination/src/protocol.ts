@@ -87,7 +87,7 @@ export interface MultiResult {
 export interface TreeResult {
 	error: ErrorCode;
 	stat?: Stat;
-	nodes: { path: string; data: Uint8Array; version: number }[];
+	nodes: { path: string; data: Uint8Array; version: number; ctime: number }[];
 }
 
 export interface WatchEvent {

@@ -311,6 +311,10 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
   warm engine took 36 ms for `lowerUTF8` of 1 million ASCII rows, 660 ms for non-ASCII ones, and 1.7 s to sort 100,000
   strings with `COLLATE`, against 9 ms without. Hot loops do not belong in JavaScript: its loops over typed arrays were
   1.5 to 2 times slower than WebAssembly, and a call per row about 13 times. `system.collations` is empty.
+- **Deduplication.** An `INSERT` with the setting `insert_deduplication_token` commits once per table: its token goes in
+  the transaction of its parts (`src/catalog.ts`), and a later attempt, or one at the same time, deletes what it wrote
+  and succeeds. So a client can send an `INSERT` again when it does not know whether it committed. The whole `INSERT`
+  is deduplicated, as it commits as one, not each block as in `ReplicatedMergeTree`. Tokens go after 24 hours.
 - **Garbage.** An hourly Cron Trigger (`src/garbage.ts`) deletes the parts in R2 that no table has and that are
   older than an hour: the parts of a commit that failed and were not deleted then. A bucket belongs to one catalog.
 

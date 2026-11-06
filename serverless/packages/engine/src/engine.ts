@@ -40,6 +40,8 @@ export type CatalogChange =
 			table: string;
 			added: string | null;
 			rows?: number;
+			/// The setting `insert_deduplication_token` of the `INSERT`: the catalog commits it once.
+			deduplication_token?: string;
 			removed: string[];
 			/// The commands on partitions: parts to detach, and detached parts to attach and to delete.
 			detached: string[];

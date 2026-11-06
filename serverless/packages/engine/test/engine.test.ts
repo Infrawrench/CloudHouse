@@ -243,6 +243,16 @@ describe("output of a query", () => {
 	});
 });
 
+describe("deduplication over HTTP", () => {
+	it("applies a retried INSERT with a body once, and says that it succeeded", async () => {
+		await query("CREATE TABLE retried (k UInt64) ENGINE = MergeTree ORDER BY k");
+		const insert = "INSERT INTO retried SETTINGS insert_deduplication_token = 'batch-1' FORMAT TSV";
+		expect((await query(insert, { body: "1\n2\n3\n" })).status).toBe(200);
+		expect((await query(insert, { body: "1\n2\n3\n" })).status).toBe(200);
+		expect((await query("SELECT count() FROM retried")).text).toBe("3\n");
+	});
+});
+
 describe("functions in the host", () => {
 	const one = async (sql: string) => {
 		const { status, text } = await query(sql);
