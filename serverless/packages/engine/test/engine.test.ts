@@ -243,6 +243,50 @@ describe("output of a query", () => {
 	});
 });
 
+describe("functions in the host", () => {
+	const one = async (sql: string) => {
+		const { status, text } = await query(sql);
+		expect(status, `${sql}: ${text}`).toBe(200);
+		return text;
+	};
+
+	it("changes the case of UTF-8, as Unicode says", async () => {
+		expect(await one("SELECT lowerUTF8('MÜNCHEN'), upperUTF8('münchen')")).toBe("münchen\tMÜNCHEN\n");
+		/// The result can be longer than the input.
+		expect(await one("SELECT upperUTF8('straße'), length(upperUTF8('straße'))")).toBe("STRASSE\t7\n");
+		/// A final sigma.
+		expect(await one("SELECT lowerUTF8('ΣΑΣ')")).toBe("σας\n");
+		/// Only ASCII, which does not go to the host.
+		expect(await one("SELECT lowerUTF8('AbC 1'), upperUTF8('AbC 1')")).toBe("abc 1\tABC 1\n");
+	});
+
+	it("normalizes UTF-8", async () => {
+		expect(await one("SELECT hex(normalizeUTF8NFD('é')), hex(normalizeUTF8NFC(unhex('65CC81')))")).toBe("65CC81\tC3A9\n");
+		expect(await one("SELECT normalizeUTF8NFKC('ﬁ'), normalizeUTF8NFKD('ﬁ'), normalizeUTF8NFC('ﬁ')")).toBe("fi\tfi\tﬁ\n");
+	});
+
+	it("keeps the rows of a block apart, and leaves what is not UTF-8 as it is", async () => {
+		expect(await one("SELECT lowerUTF8(if(number % 2 = 0, 'Ä', '')) AS x, length(x) FROM numbers(4)")).toBe("ä\t2\n\t0\nä\t2\n\t0\n");
+		expect(await one("SELECT hex(lowerUTF8(s)) FROM (SELECT arrayJoin([unhex('41FF'), 'Ä', unhex('EFBBBF41')]) AS s)")).toBe("41FF\nC3A4\nEFBBBF61\n");
+		expect(await one("SELECT sum(length(lowerUTF8(concat('Ä', toString(number))))) FROM numbers(100000)")).toBe("688890\n");
+	});
+
+	it("sorts by the rules of a locale", async () => {
+		const table = "(SELECT arrayJoin(['z', 'ä', 'a', 'b']) AS x)";
+		const sorted = async (locale: string) => (await one(`SELECT x FROM ${table} ORDER BY x COLLATE '${locale}'`)).trim().split("\n");
+		expect(await sorted("de")).toEqual(["a", "ä", "b", "z"]);
+		expect(await sorted("sv")).toEqual(["a", "b", "z", "ä"]);
+		expect((await one("SELECT x FROM (SELECT arrayJoin(['a10', 'a2']) AS x) ORDER BY x COLLATE 'en-u-kn-true'")).trim().split("\n")).toEqual(["a2", "a10"]);
+		const { status, text } = await query(`SELECT x FROM ${table} ORDER BY x COLLATE 'not a locale'`);
+		expect(status).toBe(500);
+		expect(text).toMatch(/Unsupported collation locale/);
+	});
+
+	it("hashes", async () => {
+		expect(await one("SELECT hex(MD5('a')), hex(SHA1('a')), hex(SHA256('a')), hex(SHA512('a'))")).toBe("0CC175B9C0F1B6A831C399E269772661\t86F7E437FAA5A7FCE15D1DDCB9EAEAEA377667B8\tCA978112CA1BBDCAFAC231B39A23DC4DA786EFF8147C4E72B9807785AFEE48BB\t1F40FC92DA241694750979EE6CF582F2D5D7D28E18335DE05ABC54D0560E0F5302860C652BF08D560252AA5E74210546F369FBBBCE8C12CFC7957B2652FE9A75\n");
+	});
+});
+
 describe("preferWarm", () => {
 	it("puts the objects that came back cold lately last", () => {
 		const now = 1_000_000_000;

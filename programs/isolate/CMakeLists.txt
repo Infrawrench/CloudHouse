@@ -11,7 +11,7 @@ add_library(clickhouse_functions_isolate STATIC
 get_target_property(clickhouse_functions_isolate_link clickhouse_functions_obj LINK_LIBRARIES)
 target_link_libraries(clickhouse_functions_isolate PUBLIC ${clickhouse_functions_isolate_link})
 
-clickhouse_add_executable(clickhouse-isolate isolate.cpp registerIsolate.cpp ObjectMergeTree.cpp ObjectPart.cpp)
+clickhouse_add_executable(clickhouse-isolate isolate.cpp registerIsolate.cpp ObjectMergeTree.cpp ObjectPart.cpp HostFunctions.cpp)
 target_link_libraries(clickhouse-isolate PRIVATE
     clickhouse_functions_isolate
     clickhouse_aggregate_functions

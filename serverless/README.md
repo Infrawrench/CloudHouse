@@ -303,6 +303,12 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
   wait has no deadline. `EngineHost.busy` says the same. The gateway passes over an engine that has been busy for more
   than 30 s, or does not say how busy it is in 250 ms, as it does one that came back cold: a stuck engine never comes
   back at all, and the gateway kept choosing the stuck engines while it passed over those that Cloudflare replaced.
+- **Functions in V8.** The isolate has no ICU, which would add megabytes, and V8 has it: `lowerUTF8`, `upperUTF8` and
+  `normalizeUTF8NFC`, `NFD`, `NFKC` and `NFKD` go to the Worker, a block at a time (`HostFunctions.cpp`, `src/text.ts`).
+  A block of only ASCII stays in the engine. `COLLATE` uses `Intl.Collator`, a call per comparison: on 2026-11-06, a
+  warm engine took 36 ms for `lowerUTF8` of 1 million ASCII rows, 660 ms for non-ASCII ones, and 1.7 s to sort 100,000
+  strings with `COLLATE`, against 9 ms without. Hot loops do not belong in JavaScript: its loops over typed arrays were
+  1.5 to 2 times slower than WebAssembly, and a call per row about 13 times. `system.collations` is empty.
 - **Garbage.** An hourly Cron Trigger (`src/garbage.ts`) deletes the parts in R2 that no table has and that are
   older than an hour: the parts of a commit that failed and were not deleted then. A bucket belongs to one catalog.
 

@@ -1,3 +1,4 @@
+import { compareCollated, openCollator, transformStrings } from "./text";
 import createClickHouse, { type ClickHouseModule } from "../dist/clickhouse-isolate.mjs";
 import wasm from "../dist/clickhouse-isolate.wasm";
 import { loadData } from "./data";
@@ -124,6 +125,9 @@ export class Engine {
 				writeOutput(data) {
 					engine!.keepOutput(data);
 				},
+				transformStrings,
+				openCollator,
+				compareCollated,
 				readInput(size) {
 					if (engine!.input === undefined) {
 						throw new Error("The engine reads the body of a query that has none");

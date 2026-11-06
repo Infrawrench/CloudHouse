@@ -18,6 +18,11 @@
 
 #include <limits>
 
+#if defined(OS_WASM_ISOLATE)
+extern "C" int ch_host_collator_open(const char * locale, size_t size);
+extern "C" int ch_host_collator_compare(int collator, const char * a, size_t a_size, const char * b, size_t b_size);
+#endif
+
 /// ICU wraps every entry point in a `U_ICU_ENTRY_POINT_RENAME(name)` macro that
 /// re-uses the original name during expansion (`#define ucol_open
 /// U_ICU_ENTRY_POINT_RENAME(ucol_open)`), so every ICU call below triggers
@@ -121,6 +126,12 @@ Collator::Collator(const std::string & locale_)
         ucol_close(collator);
         throw DB::Exception(DB::ErrorCodes::UNSUPPORTED_COLLATION_LOCALE, "Failed to open locale: {} with error: {}", locale, u_errorName(status));
     }
+#elif defined(OS_WASM_ISOLATE)
+    /// No ICU in an isolate: V8 has it. `collator` holds the number of the collator in the host, plus one.
+    const int host_collator = ch_host_collator_open(locale.data(), locale.size());
+    if (host_collator < 0)
+        throw DB::Exception(DB::ErrorCodes::UNSUPPORTED_COLLATION_LOCALE, "Unsupported collation locale: {}", locale);
+    collator = reinterpret_cast<UCollator *>(static_cast<uintptr_t>(host_collator) + 1);
 #else
     throw DB::Exception(DB::ErrorCodes::SUPPORT_IS_DISABLED,
                         "Collations support is disabled, because ClickHouse was built without ICU library");
@@ -159,6 +170,8 @@ int Collator::compare(const char * str1, size_t length1, const char * str2, size
      *     UCOL_LESS = -1
      */
     return compare_result;
+#elif defined(OS_WASM_ISOLATE)
+    return ch_host_collator_compare(static_cast<int>(reinterpret_cast<uintptr_t>(collator) - 1), str1, length1, str2, length2);
 #else
     (void)str1;
     (void)length1;

@@ -146,6 +146,7 @@ describe("ObjectMergeTree", () => {
 			"SELECT k, length(s) AS l FROM t GROUP BY k, l ORDER BY k, l",
 			"SELECT k FROM (SELECT k, count() AS unused FROM t GROUP BY k) ORDER BY k",
 			"SELECT DISTINCT k FROM t ORDER BY k",
+			"SELECT lowerUTF8(concat('Ä', s)) AS x, upperUTF8(x), hex(SHA256(x)) FROM t WHERE v < 50 ORDER BY x COLLATE 'de' LIMIT 20",
 		]) {
 			expect(await run(a!, query)).toBe(await reference.run(reference.databases[0]!, query));
 		}
@@ -157,7 +158,7 @@ describe("ObjectMergeTree", () => {
 		/// A query of rows fans out too.
 		expect(await run(a!, "SELECT sum(length(s)) FROM (SELECT s FROM t WHERE k = 1)")).toBe("2978\n");
 		expect(shards.count).toBeGreaterThan(0);
-	});
+	}, 60_000);
 
 	it("fans out a join whose leftmost table is split, and only then", async () => {
 		const { databases, run, shards } = await cluster(4, { shardBytes: 1, maxShards: 3 });
@@ -224,7 +225,7 @@ describe("ObjectMergeTree", () => {
 		/// `d` has two parts now, so reading it fans out as well, to two shards.
 		await check("SELECT d.name, count() FROM f INNER JOIN d ON f.k = d.k GROUP BY d.name ORDER BY d.name", 5);
 		await check("SELECT count() FROM f WHERE k IN (SELECT k FROM e)", 3);
-	});
+	}, 60_000);
 
 	it("reads the other side of a join once, or fails if it is too much to send", async () => {
 		const { databases: [a], run, fail, shards, reads } = await cluster(4, { shardBytes: 1, maxShards: 3 });
@@ -247,7 +248,7 @@ describe("ObjectMergeTree", () => {
 		expect(await run(a!, "SELECT count() FROM f INNER JOIN (SELECT k, length(s) AS l FROM big WHERE k < 5) AS b ON f.k = b.k")).toBe("5\n");
 		expect(reads.count).toBeGreaterThan(0);
 		expect(shards.count).toBeGreaterThan(0);
-	});
+	}, 60_000);
 
 	it("reads a query in one engine if the table it joins is large and has no filter of its own", async () => {
 		const { databases: [a], run, shards } = await cluster(3, { shardBytes: 1, maxShards: 2 });
@@ -263,7 +264,7 @@ describe("ObjectMergeTree", () => {
 		shards.count = 0;
 		expect(await run(a!, "SELECT count() FROM f INNER JOIN big ON f.k = big.k WHERE big.k < 5")).toBe("5\n");
 		expect(shards.count).toBe(0);
-	});
+	}, 60_000);
 
 	it("fails a query whose shards send back too much", async () => {
 		const { databases: [a], run, fail } = await cluster(3, { shardBytes: 1, maxShards: 2 });

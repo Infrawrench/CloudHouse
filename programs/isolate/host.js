@@ -91,6 +91,58 @@ addToLibrary({
     }
   },
 
+  // size_t ch_host_transform_strings(int operation, const char * chars, size_t chars_size, const uint64_t * offsets, size_t rows)
+  // Runs `operation` on a block of strings. The engine takes the result with `ch_host_take_strings`, whose size this returns.
+  $hostStrings: "null",
+  ch_host_transform_strings__deps: ["$hostError", "$hostStrings"],
+  ch_host_transform_strings__sig: "pippp",
+  ch_host_transform_strings: function (operation, chars, chars_size, offsets, rows) {
+    try {
+      hostStrings = Module.host.transformStrings(
+        operation,
+        HEAPU8.subarray(Number(chars), Number(chars) + Number(chars_size)),
+        new BigUint64Array(HEAPU8.buffer, Number(offsets), Number(rows)),
+      );
+      return hostStrings.chars.length;
+    } catch (error) {
+      hostError = String(error);
+      return -1;
+    }
+  },
+
+  // void ch_host_take_strings(char * chars, uint64_t * offsets)
+  ch_host_take_strings__deps: ["$hostStrings"],
+  ch_host_take_strings__sig: "vpp",
+  ch_host_take_strings: function (chars, offsets) {
+    // The engine has grown its columns for these, so `HEAPU8` is the view of now.
+    HEAPU8.set(hostStrings.chars, Number(chars));
+    new BigUint64Array(HEAPU8.buffer, Number(offsets), hostStrings.offsets.length).set(hostStrings.offsets);
+    hostStrings = null;
+  },
+
+  // int ch_host_collator_open(const char * locale, size_t size)
+  // The number of the collator of a locale, or -1 if the locale is not supported.
+  ch_host_collator_open__deps: ["$hostError"],
+  ch_host_collator_open__sig: "ipp",
+  ch_host_collator_open: function (locale, size) {
+    try {
+      return Module.host.openCollator(UTF8ToString(Number(locale), Number(size)));
+    } catch (error) {
+      hostError = String(error);
+      return -1;
+    }
+  },
+
+  // int ch_host_collator_compare(int collator, const char * a, size_t a_size, const char * b, size_t b_size)
+  ch_host_collator_compare__sig: "iipppp",
+  ch_host_collator_compare: function (collator, a, a_size, b, b_size) {
+    return Module.host.compareCollated(
+      collator,
+      HEAPU8.subarray(Number(a), Number(a) + Number(a_size)),
+      HEAPU8.subarray(Number(b), Number(b) + Number(b_size)),
+    );
+  },
+
   // void ch_host_prefetch(const char * part, size_t part_size, size_t offset, size_t size)
   ch_host_prefetch__sig: "vpppp",
   ch_host_prefetch: function (part, part_size, offset, size) {

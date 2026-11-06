@@ -53,7 +53,7 @@
     M(ArrayEnumerate) M(ArrayConcat) M(ArrayPushBack) M(ArraySlice) M(ArrayReverse) M(ArrayUniq) M(ArrayCount) \
     M(ArrayAggregation) M(Map) \
     /* Hashes, random numbers, and the rest. */ \
-    M(Hashing) M(Rand) M(Rand64) M(GenerateUUIDv4) M(Version) M(CurrentDatabase) M(CurrentUser) M(Sleep) \
+    M(Hashing) M(MD5) M(SHA1) M(HashFixedStrings) M(HostStrings) M(Rand) M(Rand64) M(GenerateUUIDv4) M(Version) M(CurrentDatabase) M(CurrentUser) M(Sleep) \
     /* More of the functions that queries use often. */ \
     M(ToCustomWeek) M(ToISOWeek) M(ToRelativeDayNum) M(ToStartOfFiveMinutes) M(ToStartOfFifteenMinutes) M(MonthName) M(DateName) \
     M(ArrayFlatten) M(ArrayZip) M(ArrayIntersect) M(ArrayFirst) M(ArrayResize) M(ArrayFill) M(ArrayCumSum) M(ArrayDifference) \

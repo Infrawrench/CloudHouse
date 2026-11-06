@@ -47,6 +47,9 @@ declare module "*/clickhouse-isolate.mjs" {
 			writePart(part: string, data: Uint8Array): Promise<void>;
 			readInput(size: number): Promise<Uint8Array>;
 			writeOutput(data: Uint8Array): void;
+			transformStrings(operation: number, chars: Uint8Array, offsets: BigUint64Array): { chars: Uint8Array; offsets: BigUint64Array };
+			openCollator(locale: string): number;
+			compareCollated(collator: number, a: Uint8Array, b: Uint8Array): number;
 		};
 	}
 
