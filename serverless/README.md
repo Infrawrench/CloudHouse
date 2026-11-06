@@ -257,9 +257,11 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
   read the table in one engine: a table of more than 8 MiB on the right with no subquery to filter it
   (`max_broadcast_table_bytes`); `RIGHT`, `FULL`, `PASTE`, `CROSS` and `ANY INNER` joins, which would give other rows
   split among shards; and a point query, which reads its few blocks. A change to what a coordinator asks of its shards
-  can't roll out in place: on 2026-11-06, after a deploy that added the rows sent, queries that sent them failed for
-  minutes on the objects that `KEEP_WARM_SECONDS` keeps running, and did not on a deployment without it. Deleting and
-  creating the namespace of `EngineHost`, which holds no data, takes 90 s and starts every object on the new code.
+  breaks while it rolls out, as objects move to a new version one by one, over 1 to 3 minutes with `KEEP_WARM_SECONDS`
+  (measured 2026-11-06: 8 of 8 engines and all shards about 90 s after an upload). The deploy that added the rows sent
+  failed its queries for that long, and was rolled back. Deleting and creating the namespace of `EngineHost`, which
+  holds no data, takes 90 s and starts every object on the new code. Other deploys need neither: 62 and 50 queries in
+  a row succeeded through two of them.
 - **Caching.** Engines read ranges of parts through `PartCache` (`src/cache.ts`), an entrypoint of the Worker behind
   Workers Caching, which works on `workers.dev` and in front of loopback calls: a part never changes, so an engine
   reads a range from the cache of its data center if another engine there has read it. The cache keeps the ranges, not
