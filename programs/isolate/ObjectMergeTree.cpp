@@ -2,8 +2,16 @@
 #include "ObjectPart.h"
 
 #include <Analyzer/AggregationUtils.h>
+#include <Analyzer/FunctionNode.h>
 #include <Analyzer/JoinNode.h>
 #include <Analyzer/Utils.h>
+#include <Compression/CompressedReadBuffer.h>
+#include <Compression/CompressedWriteBuffer.h>
+#include <Compression/CompressionFactory.h>
+#include <Processors/Executors/PushingPipelineExecutor.h>
+#include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
+#include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
+#include <Storages/StorageMemory.h>
 #include <Analyzer/QueryNode.h>
 #include <Columns/ColumnConst.h>
 #include <Analyzer/TableNode.h>
@@ -108,10 +116,57 @@ namespace ErrorCodes
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
     extern const int READONLY_SETTING;
     extern const int SUPPORT_IS_DISABLED;
+    extern const int TOO_MANY_ROWS_OR_BYTES;
 }
 
 namespace
 {
+
+/// The most rows that the coordinator sends to each shard of a query, in compressed bytes: what the query joins this
+/// table with, or looks up with `IN`. It sends them to every shard at once, so they are in its Worker that many times.
+constexpr size_t max_broadcast_bytes = 1024 * 1024;
+/// A table on the other side of a join, without a filter of its own, is read whole to send it: past this many bytes in
+/// its parts, it would be too much to send, and the query reads here. A subquery can filter it, and always goes.
+constexpr UInt64 max_broadcast_table_bytes = 8 * 1024 * 1024;
+
+bool isInWithTable(const FunctionNode & function)
+{
+    if (!isNameOfInFunction(function.getFunctionName()) || function.getArguments().getNodes().size() != 2)
+        return false;
+    const auto type = function.getArguments().getNodes()[1]->getNodeType();
+    return type == QueryTreeNodeType::QUERY || type == QueryTreeNodeType::UNION || type == QueryTreeNodeType::TABLE
+        || type == QueryTreeNodeType::TABLE_FUNCTION;
+}
+
+/// Calls `visit` on the nodes of the query that the shards run. The right side of a join and the set of an `IN` are not
+/// among them: the coordinator reads those once, and sends them to the shards.
+template <typename Visit>
+void visitNodesOnShards(const QueryTreeNodePtr & tree, Visit && visit)
+{
+    QueryTreeNodes stack{tree};
+    while (!stack.empty())
+    {
+        const auto node = std::move(stack.back());
+        stack.pop_back();
+        if (!node)
+            continue;
+        visit(node);
+        if (auto * join = node->as<JoinNode>())
+        {
+            stack.push_back(join->getLeftTableExpressionNode());
+            stack.push_back(join->getJoinExpression());
+        }
+        else if (auto * function = node->as<FunctionNode>(); function && isInWithTable(*function))
+        {
+            stack.push_back(function->getArguments().getNodes()[0]);
+        }
+        else
+        {
+            for (const auto & child : node->getChildren())
+                stack.push_back(child);
+        }
+    }
+}
 
 /// Whether the joins of `join_tree` give the same rows when its leftmost table is split among shards, each of which
 /// joins its rows with the whole of the other side: `INNER` and `LEFT` joins, each row of the left side on its own, do.
@@ -531,17 +586,24 @@ public:
         if (!query_node || !query_info.table_expression)
             return QueryProcessingStage::FetchColumns;
         /// A query that joins this table with others fans out when this table is the leftmost of its joins: the planner
-        /// then gives the whole join to this table, as it does to `Distributed`, and each shard joins its parts with the
-        /// whole of the other tables, which it reads itself. `instance_types` and the like are small; `prices` is not.
+        /// then gives the whole join to this table, as it does to `Distributed`. The coordinator reads the other side of a
+        /// join or `IN` once, itself with shards if it is large, and sends it to the shards (`broadcast`): each joins its
+        /// parts with those rows, whatever they came from, as `GLOBAL JOIN` does. `prices` joined with a subquery on
+        /// `prices` reads it twice, each split among the shards.
         const auto & join_tree = query_node->getJoinTreeNode();
         if (join_tree.get() != query_info.table_expression.get()
-            && (extractLeftTableExpression(query_node->getJoinTreeNodeTyped()).get() != query_info.table_expression.get() || !joinsSplitByLeftTable(join_tree)))
+            && (extractLeftTableExpression(query_node->getJoinTreeNodeTyped()).get() != query_info.table_expression.get()
+                || !joinsSplitByLeftTable(join_tree) || !rightSidesFit(join_tree)))
             return QueryProcessingStage::FetchColumns;
-        /// A shard sees only its parts of this table, so a query that reads it again, in a subquery, an `IN` or on the
-        /// other side of a join, would see only those there too. And the other tables that a query reads have to be there
-        /// on a shard: a table of `Memory` or a view belongs to one engine.
-        const auto tables = tablesRead(query_info.query_tree, getStorageID());
-        if (tables.this_table != 1 || !tables.others_on_shards)
+        /// Anything else that the query reads would be read on each shard, which sees only its parts of this table, and
+        /// which has no table of `Memory` or view of this engine. A scalar subquery, for one.
+        bool other_tables = false;
+        visitNodesOnShards(query_info.query_tree, [&](const QueryTreeNodePtr & node)
+        {
+            const auto type = node->getNodeType();
+            other_tables |= (type == QueryTreeNodeType::TABLE || type == QueryTreeNodeType::TABLE_FUNCTION) && node.get() != query_info.table_expression.get();
+        });
+        if (other_tables)
             return QueryProcessingStage::FetchColumns;
         /// A query of rows fans out too: read here, a `SELECT *` with a filter on columns outside the key read 200 MiB of
         /// parts in one engine, which took tens of seconds and could exceed the memory of the isolate. A shard sends back
@@ -1082,46 +1144,37 @@ private:
         return true;
     }
 
-    struct TablesRead
+    /// Whether the tables on the right of the joins of `join_tree` are small enough to send to the shards.
+    static bool rightSidesFit(const QueryTreeNodePtr & join_tree)
     {
-        size_t this_table = 0;
-        size_t others = 0;
-        /// All the others are tables of the catalog, which every shard has.
-        bool others_on_shards = true;
-    };
-
-    /// The tables that `tree` reads, anywhere: in its joins, its subqueries, its `IN`s.
-    static TablesRead tablesRead(const QueryTreeNodePtr & tree, const StorageID & table_id)
-    {
-        TablesRead tables;
-        std::vector<const IQueryTreeNode *> stack{tree.get()};
-        while (!stack.empty())
+        const IQueryTreeNode * node = join_tree.get();
+        while (const auto * join = node->as<JoinNode>())
         {
-            const auto * node = stack.back();
-            stack.pop_back();
-            if (!node)
-                continue;
-            if (const auto * table = node->as<TableNode>())
+            const auto * table = join->getRightTableExpressionNode()->as<TableNode>();
+            if (table && typeid_cast<const StorageObjectMergeTree *>(table->getStorage().get()))
             {
-                if (table->getStorageID() == table_id)
-                {
-                    ++tables.this_table;
-                }
-                else
-                {
-                    ++tables.others;
-                    tables.others_on_shards &= typeid_cast<const StorageObjectMergeTree *>(table->getStorage().get()) != nullptr;
-                }
+                UInt64 bytes = 0;
+                for (const auto & part : ObjectPartStore::instance().getVisibleParts(table->getStorageID()))
+                    bytes += ObjectPartName::parse(part).bytes;
+                if (bytes > max_broadcast_table_bytes)
+                    return false;
             }
-            else if (node->getNodeType() == QueryTreeNodeType::TABLE_FUNCTION)
-            {
-                ++tables.others;
-                tables.others_on_shards = false;
-            }
-            for (const auto & child : node->getChildren())
-                stack.push_back(child.get());
+            node = join->getLeftTableExpressionNode().get();
         }
-        return tables;
+        return true;
+    }
+
+    /// Makes the joins and `IN`s of the query for the shards global: `buildQueryTreeForShard` runs their other sides here,
+    /// into tables of the query context.
+    static void broadcast(const QueryTreeNodePtr & tree, const ContextPtr & context)
+    {
+        visitNodesOnShards(tree, [&](const QueryTreeNodePtr & node)
+        {
+            if (auto * join = node->as<JoinNode>())
+                join->setLocality(JoinLocality::Global);
+            else if (auto * function = node->as<FunctionNode>(); function && isInWithTable(*function) && !isNameOfGlobalInFunction(function->getFunctionName()))
+                resolveOrdinaryFunctionNodeByName(*function, getGlobalInFunctionNameForLocalInFunctionName(function->getFunctionName()), context);
+        });
     }
 
     /// As `StorageDistributed::read`: the query for the shards is the query tree with the table in it, and their
@@ -1141,8 +1194,9 @@ private:
             if (const auto & modifiers = table_node->getTableExpressionModifiers())
                 shard_table->setTableExpressionModifiers(*modifiers);
         shard_table->setAlias(query_info.table_expression->getAlias());
-        auto shard_tree = buildQueryTreeForShard(
-            planner_context, query_info.query_tree->cloneAndReplace(query_info.table_expression, std::move(shard_table)), false);
+        auto tree_to_modify = query_info.query_tree->cloneAndReplace(query_info.table_expression, std::move(shard_table));
+        broadcast(tree_to_modify, context);
+        auto shard_tree = buildQueryTreeForShard(planner_context, std::move(tree_to_modify), false);
 
         Block header = *InterpreterSelectQueryAnalyzer::getSampleBlock(shard_tree, context, SelectQueryOptions(processed_stage).analyze());
         for (auto & column : header)
@@ -1158,13 +1212,17 @@ private:
         const auto * results = store.getFanOutResults(table_id, shard_query);
         if (!results)
         {
-            const bool other_tables = tablesRead(query_info.query_tree, table_id).others != 0;
-            store.addFanOutRequest({.database = table_id.database_name, .table = table_id.table_name, .query = shard_query, .other_tables = other_tables});
+            store.addFanOutRequest({
+                .database = table_id.database_name,
+                .table = table_id.table_name,
+                .query = shard_query,
+                .broadcast = ObjectPartStore::encodeBroadcast(planner_context->getQueryContext(), shard_query)});
             throw Exception(ErrorCodes::NOT_FOUND_EXPECTED_DATA_PART, "The query on table {} fans out to shards", table_id.getNameForLogs());
         }
 
         /// As `RemoteSource`: aggregation states are merged by bucket, which the block info of a shard carries.
-        bool aggregated = false;
+        /// A `GROUP BY` without aggregate functions, or whose aggregates the query does not use, has no column of a state.
+        bool aggregated = query_info.query_tree->as<const QueryNode &>().hasGroupBy();
         for (const auto & type : header.getDataTypes())
             aggregated |= typeid_cast<const DataTypeAggregateFunction *>(type.get()) != nullptr;
 
@@ -1515,6 +1573,72 @@ String ObjectPartStore::encodeBlocks(const Blocks & blocks)
     }
     out.finalize();
     return data;
+}
+
+String ObjectPartStore::encodeBroadcast(const ContextPtr & context, std::string_view query)
+{
+    String data;
+    WriteBufferFromString out(data);
+    CompressedWriteBuffer compressed{out, CompressionCodecFactory::instance().get("ZSTD", 1), 64 * 1024};
+    for (const auto & [name, table] : context->getExternalTables())
+    {
+        if (query.find(name) == std::string_view::npos || !std::dynamic_pointer_cast<StorageMemory>(table))
+            continue;
+        SelectQueryInfo query_info;
+        const auto metadata = table->getInMemoryMetadataPtr(context, false);
+        const auto snapshot = table->getStorageSnapshot(metadata, context);
+        const auto stage = table->getQueryProcessingStage(context, QueryProcessingStage::Complete, snapshot, query_info);
+        QueryPlan plan;
+        table->read(plan, metadata->getColumns().getNamesOfPhysical(), snapshot, query_info, context, stage, DEFAULT_BLOCK_SIZE, 1);
+        auto pipeline = QueryPipelineBuilder::getPipeline(
+            std::move(*plan.buildQueryPipeline(QueryPlanOptimizationSettings(context), BuildQueryPipelineSettings(context))));
+        Blocks blocks;
+        {
+            PullingPipelineExecutor executor(pipeline);
+            blocks.push_back(executor.getHeader().cloneEmpty());
+            Block block;
+            while (executor.pull(block))
+                if (block.rows())
+                    blocks.push_back(std::move(block));
+        }
+        writeStringBinary(name, compressed);
+        writeStringBinary(encodeBlocks(blocks), compressed);
+    }
+    compressed.finalize();
+    out.finalize();
+    if (data.size() > max_broadcast_bytes)
+        throw Exception(
+            ErrorCodes::TOO_MANY_ROWS_OR_BYTES,
+            "The other side of a join or IN of the query has more than {} MiB of rows, compressed: filter or aggregate it in a subquery",
+            max_broadcast_bytes / 1024 / 1024);
+    return data;
+}
+
+void ObjectPartStore::addBroadcast(const ContextMutablePtr & context, std::string_view data)
+{
+    if (data.empty())
+        return;
+    ReadBufferFromMemory in(data.data(), data.size());
+    CompressedReadBuffer compressed(in);
+    while (!compressed.eof())
+    {
+        String name;
+        String encoded;
+        readStringBinary(name, compressed);
+        readStringBinary(encoded, compressed);
+        const Blocks blocks = decodeBlocks(encoded);
+        auto holder = TemporaryTableHolder(context, ColumnsDescription(blocks.front().getNamesAndTypesList()), {});
+        const auto table = holder.getTable();
+        context->addExternalTable(name, std::move(holder));
+        const auto metadata = table->getInMemoryMetadataPtr(context, false);
+        QueryPipeline pipeline(table->write(ASTPtr(), metadata, context, /* async_insert= */ false));
+        PushingPipelineExecutor executor(pipeline);
+        executor.start();
+        for (const auto & block : blocks)
+            if (block.rows())
+                executor.push(block);
+        executor.finish();
+    }
 }
 
 Blocks ObjectPartStore::decodeBlocks(std::string_view data)

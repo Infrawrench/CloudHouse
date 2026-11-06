@@ -356,16 +356,20 @@ void runQuery(std::string_view query, std::string_view default_format, bool read
 
 /// Runs the query of a shard up to `WithMergeableState` on `parts` of a table, and makes its result the blocks it
 /// produces.
+/// What the last fan-out requests send to their shards, until the host takes it (`ch_isolate_fanout_broadcast`).
+std::vector<String> fan_out_broadcasts;
+
 /// The most that a shard sends back, in the bytes of its blocks. The result of a shard is held whole, here, in the
 /// Worker, and in the coordinator, which holds those of all its shards: past this, the query fails, rather than the
 /// isolate of the shard or of the coordinator running out of memory. A query that aggregates, or with a `LIMIT`, sends
 /// back much less than this; a query of rows without one, as much as its filter keeps.
 constexpr size_t max_shard_result_bytes = 4 * 1024 * 1024;
 
-void runShardQuery(std::string_view query, const String & database, const String & table, Strings parts)
+void runShardQuery(std::string_view query, const String & database, const String & table, Strings parts, std::string_view broadcast)
 {
     auto context = makeQueryContext(/* readonly= */ false);
     auto query_scope = QueryScope::create(context);
+    ObjectPartStore::addBroadcast(context, broadcast);
     auto & store = ObjectPartStore::instance();
     store.beginOverride(database, table, std::move(parts));
     store.setShardQuery(true);
@@ -544,9 +548,10 @@ int ch_isolate_changes();
 int ch_isolate_clear_changes();
 int ch_isolate_set_fanout(const char * spec, size_t spec_size);
 int ch_isolate_fanout_requests();
+int ch_isolate_fanout_broadcast(size_t index);
 int ch_isolate_add_fanout_result(const char * spec, size_t spec_size, const char * data, size_t data_size);
 int ch_isolate_clear_fanout();
-int ch_isolate_shard_query(const char * query, size_t query_size, const char * spec, size_t spec_size);
+int ch_isolate_shard_query(const char * query, size_t query_size, const char * spec, size_t spec_size, const char * broadcast, size_t broadcast_size);
 const char * ch_isolate_result_data();
 size_t ch_isolate_result_size();
 [[noreturn]] void ch_isolate_cut_code(int index);
@@ -652,19 +657,27 @@ EMSCRIPTEN_KEEPALIVE int ch_isolate_fanout_requests()
 {
     return DB::run([]
     {
+        DB::fan_out_broadcasts.clear();
         DB::WriteBufferFromString out(DB::result);
-        for (const auto & request : DB::ObjectPartStore::instance().takeFanOutRequests())
+        for (auto & request : DB::ObjectPartStore::instance().takeFanOutRequests())
         {
+            DB::fan_out_broadcasts.push_back(std::move(request.broadcast));
             writeCString("{\"database\":", out);
             DB::writeJSONString(request.database, out, {});
             writeCString(",\"table\":", out);
             DB::writeJSONString(request.table, out, {});
             writeCString(",\"query\":", out);
             DB::writeJSONString(request.query, out, {});
-            writeCString(request.other_tables ? ",\"otherTables\":true}\n" : ",\"otherTables\":false}\n", out);
+            writeCString("}\n", out);
         }
         out.finalize();
     });
+}
+
+/// What the fan-out request number `index` of `ch_isolate_fanout_requests` sends to its shards, as the result.
+EMSCRIPTEN_KEEPALIVE int ch_isolate_fanout_broadcast(size_t index)
+{
+    return DB::run([&] { DB::result = std::move(DB::fan_out_broadcasts.at(index)); });
 }
 
 /// The result of one shard for a fan-out request: `spec` is the database, the table, then the query of the request.
@@ -691,7 +704,8 @@ EMSCRIPTEN_KEEPALIVE int ch_isolate_clear_fanout()
 
 /// Runs the query of a shard, which the coordinator asked for in a fan-out request: `spec` is the database, the
 /// table, then the parts of the shard, one per line.
-EMSCRIPTEN_KEEPALIVE int ch_isolate_shard_query(const char * query, size_t query_size, const char * spec, size_t spec_size)
+EMSCRIPTEN_KEEPALIVE int ch_isolate_shard_query(
+    const char * query, size_t query_size, const char * spec, size_t spec_size, const char * broadcast, size_t broadcast_size)
 {
     return DB::run([&]
     {
@@ -699,7 +713,7 @@ EMSCRIPTEN_KEEPALIVE int ch_isolate_shard_query(const char * query, size_t query
         if (lines.size() < 2)
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "A shard needs a database and a table");
         DB::Strings parts(std::make_move_iterator(lines.begin() + 2), std::make_move_iterator(lines.end()));
-        DB::runShardQuery({query, query_size}, lines[0], lines[1], std::move(parts));
+        DB::runShardQuery({query, query_size}, lines[0], lines[1], std::move(parts), {broadcast, broadcast_size});
     });
 }
 

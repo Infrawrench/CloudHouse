@@ -52,10 +52,8 @@ export interface ShardRequest {
 	table: string;
 	parts: string[];
 	query: string;
-	/// For a query that reads other tables too, which the shard reads itself, the version of the catalog of the
-	/// coordinator: a shard that is behind it syncs first. Only then, as a shard that syncs waits for the lock of its
-	/// engine, and the coordinator of that engine may be waiting for shards that wait the same way.
-	version?: number;
+	/// The other sides of the joins and `IN`s of the query, which the coordinator has read once.
+	broadcast?: Uint8Array;
 }
 
 /// `cold` if the shard started its engine for the query.
@@ -152,12 +150,11 @@ export class Database {
 	/// Durable Objects can share an isolate, and so an engine: a shard can be in the isolate of its coordinator,
 	/// which holds the lock while it waits for its shards. So a shard with the same definition runs without the lock:
 	/// it changes nothing, and the engine shows it its parts for the duration of its query only. A shard with another
-	/// definition syncs, under the lock, and it is never in the isolate of the coordinator then. Neither is a shard behind
-	/// the version of the coordinator, which syncs too when the query reads other tables (`ShardRequest.version`).
+	/// definition syncs, under the lock, and it is never in the isolate of the coordinator then.
 	async shard(request: ShardRequest, io: Io): Promise<ShardAnswer> {
 		const key = tableKey(request.database, request.table);
 		const same = () => this.state.tables.get(key)?.createQuery === request.createQuery;
-		if (!same() || (request.version !== undefined && this.state.version < request.version)) {
+		if (!same()) {
 			await this.exclusive("shard sync", () => this.sync());
 			if (!same()) {
 				return { ok: false, stale: true, message: `The definition of ${request.database}.${request.table} has changed` };
@@ -184,7 +181,7 @@ export class Database {
 			},
 		};
 		try {
-			return await this.engine.shardQuery(request.query, request.database, request.table, request.parts, reader);
+			return await this.engine.shardQuery(request.query, request.database, request.table, request.parts, reader, request.broadcast);
 		} catch (error) {
 			return { ok: false, code: 0, message: String(error) };
 		}
@@ -381,7 +378,7 @@ export class Database {
 			table: table.table,
 			parts,
 			query: request.query,
-			...(request.otherTables ? { version: this.state.version } : {}),
+			...(request.broadcast.length > 0 ? { broadcast: request.broadcast } : {}),
 		}));
 		const answers = await this.runShards(requests, io, timings);
 		timings.shards = (timings.shards ?? 0) + groups.length;

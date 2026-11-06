@@ -25,9 +25,10 @@ declare module "*/clickhouse-isolate.mjs" {
 		_ch_isolate_clear_changes(): number;
 		_ch_isolate_set_fanout(spec: bigint, spec_size: bigint): number;
 		_ch_isolate_fanout_requests(): number;
+		_ch_isolate_fanout_broadcast(index: bigint): number;
 		_ch_isolate_add_fanout_result(spec: bigint, spec_size: bigint, data: bigint, data_size: bigint): number;
 		_ch_isolate_clear_fanout(): number;
-		_ch_isolate_shard_query(query: bigint, query_size: bigint, spec: bigint, spec_size: bigint): Promise<number>;
+		_ch_isolate_shard_query(query: bigint, query_size: bigint, spec: bigint, spec_size: bigint, broadcast: bigint, broadcast_size: bigint): Promise<number>;
 		_ch_isolate_result_data(): bigint;
 		_ch_isolate_result_size(): bigint;
 	}

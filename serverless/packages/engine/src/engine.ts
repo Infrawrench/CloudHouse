@@ -49,8 +49,8 @@ export interface FanOutRequest {
 	database: string;
 	table: string;
 	query: string;
-	/// The query reads other tables too, in a join or a subquery, which the shards read themselves.
-	otherTables: boolean;
+	/// The other sides of the joins and `IN`s of the query, which the coordinator has read, for the shards.
+	broadcast: Uint8Array;
 }
 
 /// Reads and writes parts, for the engine while it runs a query: the engine announces the ranges that it is going to
@@ -156,10 +156,16 @@ export class Engine {
 
 	/// Runs the query of a shard up to `WithMergeableState` on `parts` of the table, and returns its blocks. The other
 	/// queries keep seeing all the visible parts of the table.
-	shardQuery(query: string, database: string, table: string, parts: readonly string[], reader: PartIo): Promise<QueryResult> {
+	shardQuery(query: string, database: string, table: string, parts: readonly string[], reader: PartIo, broadcast?: Uint8Array): Promise<QueryResult> {
 		const spec = [database, table, ...parts].join("\n") + "\n";
 		return this.exclusive(async () => {
-			const code = await this.callAsync((q, s) => this.module._ch_isolate_shard_query(q[0], q[1], s[0], s[1]), reader, query, spec);
+			const code = await this.callAsync(
+				(q, s, b) => this.module._ch_isolate_shard_query(q[0], q[1], s[0], s[1], b[0], b[1]),
+				reader,
+				query,
+				spec,
+				broadcast ?? new Uint8Array(),
+			);
 			const body = this.takeResult();
 			return code === 0 ? { ok: true, body } : { ok: false, code, message: decoder.decode(body) };
 		});
@@ -199,7 +205,11 @@ export class Engine {
 	fanOutRequests(): Promise<FanOutRequest[]> {
 		return this.exclusive(async () => {
 			this.check(this.module._ch_isolate_fanout_requests());
-			return lines(decoder.decode(this.takeResult())).map((line) => JSON.parse(line) as FanOutRequest);
+			const requests = lines(decoder.decode(this.takeResult())).map((line) => JSON.parse(line) as Omit<FanOutRequest, "broadcast">);
+			return requests.map((request, index) => {
+				this.check(this.module._ch_isolate_fanout_broadcast(BigInt(index)));
+				return { ...request, broadcast: this.takeResult() };
+			});
 		});
 	}
 

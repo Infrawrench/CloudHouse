@@ -71,6 +71,9 @@ async function cluster(isolates: number, limits: Partial<Limits> = {}, hooks: { 
 	return { databases, io, run, fail, merge, merges, settle, parts, reads, shards };
 }
 
+/// About 1 KiB of a string that compresses to half.
+const hashes = "arrayStringConcat(arrayMap(i -> hex(sipHash64(number, i)), range(60)))";
+
 describe("ObjectMergeTree", () => {
 	it("shares tables between isolates", async () => {
 		const { databases: [a, b], run } = await cluster(2);
@@ -137,6 +140,10 @@ describe("ObjectMergeTree", () => {
 			"SELECT count(), avg(v), min(v), max(v) FROM t WHERE k != 2",
 			"SELECT k, groupArray(v) FROM (SELECT k, v FROM t WHERE v < 12) GROUP BY k ORDER BY k",
 			"SELECT v, s FROM t WHERE k = 3 AND v % 7 = 0 ORDER BY v",
+			"SELECT k FROM t GROUP BY k ORDER BY k",
+			"SELECT k, length(s) AS l FROM t GROUP BY k, l ORDER BY k, l",
+			"SELECT k FROM (SELECT k, count() AS unused FROM t GROUP BY k) ORDER BY k",
+			"SELECT DISTINCT k FROM t ORDER BY k",
 		]) {
 			expect(await run(a!, query)).toBe(await reference.run(reference.databases[0]!, query));
 		}
@@ -167,7 +174,7 @@ describe("ObjectMergeTree", () => {
 			}
 			await go(target, "CREATE VIEW vf AS SELECT k, v FROM f");
 		}
-		/// `count` is how many shards the query ran on: 3 for one fan-out of `f`, 0 if it read `f` here.
+		/// `count` is how many shards the query ran on: 3 for each read of `f` that fans out, 0 if it read `f` here.
 		const check = async (query: string, count: number) => {
 			shards.count = 0;
 			expect(await run(a!, query), query).toBe(await reference.run(r, query));
@@ -182,6 +189,12 @@ describe("ObjectMergeTree", () => {
 		await check("SELECT count() FROM f, d WHERE f.k = d.k", 3);
 		await check("SELECT s.n, count() FROM f INNER JOIN (SELECT k, upper(name) AS n FROM d) AS s ON f.k = s.k GROUP BY s.n ORDER BY s.n", 3);
 		await check("SELECT count() FROM f WHERE k IN (SELECT k FROM d)", 3);
+		await check("SELECT count() FROM f WHERE k NOT IN (SELECT k FROM d)", 3);
+		/// Nothing to send, and a join with no rows on the other side.
+		await check("SELECT count() FROM f WHERE k IN (1, 2)", 3);
+		await check("SELECT count() FROM f INNER JOIN (SELECT k FROM d WHERE name = 'none') AS s ON f.k = s.k", 3);
+		/// Two joins, each sent.
+		await check("SELECT count() FROM f INNER JOIN d ON f.k = d.k LEFT JOIN m ON f.k = m.k", 3);
 		/// The rows of `d` that no row matches would come back from every shard.
 		await check("SELECT d.name, count(f.v) FROM f RIGHT JOIN d ON f.k = d.k GROUP BY d.name ORDER BY d.name", 0);
 		await check("SELECT count() FROM f FULL JOIN d ON f.k = d.k", 0);
@@ -189,25 +202,65 @@ describe("ObjectMergeTree", () => {
 		await check("SELECT count() FROM f ANY INNER JOIN d ON f.k = d.k", 0);
 		await check("SELECT count() FROM f INNER JOIN d ON f.k = d.k SETTINGS join_default_strictness = 'ANY'", 0);
 		await check("SELECT count() FROM f CROSS JOIN d", 0);
-		/// A shard sees only its parts of `f`, so a query that reads `f` twice reads it here. Its subquery is a query of
-		/// its own, which fans out: only that one.
-		await check("SELECT count() FROM f AS x INNER JOIN f AS y ON x.v = y.v", 0);
-		await check("SELECT count() FROM f WHERE v IN (SELECT max(v) FROM f GROUP BY k)", 3);
-		await check("SELECT count() FROM f CROSS JOIN (SELECT max(v) AS m FROM f) AS s WHERE f.v = s.m", 3);
-		/// A shard does not have a table of `Memory`, a view, or what a table function reads here.
-		await check("SELECT m.label, count() FROM f INNER JOIN m ON f.k = m.k GROUP BY m.label ORDER BY m.label", 0);
-		await check("SELECT count() FROM f WHERE k IN (SELECT k FROM m)", 0);
-		await check("SELECT count() FROM f INNER JOIN vf AS x ON f.v = x.v", 3);
-		await check("SELECT count() FROM f WHERE v IN (SELECT max(v) FROM vf GROUP BY k)", 3);
-		await check("SELECT count() FROM f INNER JOIN numbers(3) AS n ON f.k = n.number", 0);
-		/// The shards are behind the coordinator for `d`, and for `e`, which they have never seen: they sync first.
+		/// The coordinator reads the other side, here with shards as well, and sends all of it: the shards do not see only
+		/// their parts of `f` in it.
+		await check("SELECT count() FROM f AS x INNER JOIN f AS y ON x.v = y.v", 6);
+		await check("SELECT count() FROM f WHERE v IN (SELECT max(v) FROM f GROUP BY k)", 6);
+		await check("SELECT f.k, s.m FROM f INNER JOIN (SELECT k, max(v) AS m FROM f GROUP BY k) AS s ON f.k = s.k AND f.v = s.m ORDER BY f.k", 6);
+		/// A table of `Memory`, a view or a table function goes the same way, which a shard could not read itself.
+		await check("SELECT m.label, count() FROM f INNER JOIN m ON f.k = m.k GROUP BY m.label ORDER BY m.label", 3);
+		await check("SELECT count() FROM f WHERE k IN (SELECT k FROM m)", 3);
+		await check("SELECT count() FROM f INNER JOIN vf AS x ON f.v = x.v", 6);
+		await check("SELECT count() FROM f WHERE v IN (SELECT max(v) FROM vf GROUP BY k)", 6);
+		await check("SELECT count() FROM f INNER JOIN numbers(3) AS n ON f.k = n.number", 3);
+		/// The other side changes: the coordinator is what reads it.
 		for (const [target, go, engine] of [[a!, run, "ObjectMergeTree ORDER BY k"], [r, reference.run, "Memory"]] as const) {
 			await go(target, "INSERT INTO d VALUES (3, 'three')");
 			await go(target, `CREATE TABLE e (k UInt8) ENGINE = ${engine}`);
 			await go(target, "INSERT INTO e VALUES (4)");
 		}
-		await check("SELECT d.name, count() FROM f INNER JOIN d ON f.k = d.k GROUP BY d.name ORDER BY d.name", 3);
+		/// `d` has two parts now, so reading it fans out as well, to two shards.
+		await check("SELECT d.name, count() FROM f INNER JOIN d ON f.k = d.k GROUP BY d.name ORDER BY d.name", 5);
 		await check("SELECT count() FROM f WHERE k IN (SELECT k FROM e)", 3);
+	});
+
+	it("reads the other side of a join once, or fails if it is too much to send", async () => {
+		const { databases: [a], run, fail, shards, reads } = await cluster(4, { shardBytes: 1, maxShards: 3 });
+		await run(a!, "CREATE TABLE f (k UInt64, v UInt64) ENGINE = ObjectMergeTree ORDER BY k");
+		for (let i = 0; i < 3; ++i) {
+			await run(a!, `INSERT INTO f SELECT number, number FROM numbers(${i * 100}, 100)`);
+		}
+		await run(a!, "CREATE TABLE d (k UInt64, s String) ENGINE = ObjectMergeTree ORDER BY k");
+		await run(a!, "INSERT INTO d SELECT number, 'x' FROM numbers(300)");
+		const join = "SELECT count() FROM f INNER JOIN d ON f.k = d.k";
+		expect(await run(a!, join)).toBe("300\n");
+
+		/// Hashes in hex compress to half: under the 4 MiB that a shard may send back, over the 1 MiB that may be sent to one.
+		await run(a!, "CREATE TABLE big (k UInt64, s String) ENGINE = ObjectMergeTree ORDER BY k");
+		await run(a!, `INSERT INTO big SELECT number, ${hashes} FROM numbers(4000)`);
+		expect(await fail(a!, "SELECT count(), sum(length(b.s)) FROM f INNER JOIN (SELECT k, s FROM big) AS b ON f.k = b.k")).toMatch(/more than 1 MiB of rows/);
+		/// A column that the query does not use is not sent.
+		expect(await run(a!, "SELECT count() FROM f INNER JOIN (SELECT k, s FROM big) AS b ON f.k = b.k")).toBe("300\n");
+		/// With a filter or an aggregation, the same table is little to send.
+		expect(await run(a!, "SELECT count() FROM f INNER JOIN (SELECT k, length(s) AS l FROM big WHERE k < 5) AS b ON f.k = b.k")).toBe("5\n");
+		expect(reads.count).toBeGreaterThan(0);
+		expect(shards.count).toBeGreaterThan(0);
+	});
+
+	it("reads a query in one engine if the table it joins is large and has no filter of its own", async () => {
+		const { databases: [a], run, shards } = await cluster(3, { shardBytes: 1, maxShards: 2 });
+		await run(a!, "CREATE TABLE f (k UInt64) ENGINE = ObjectMergeTree ORDER BY k");
+		for (let i = 0; i < 2; ++i) {
+			await run(a!, `INSERT INTO f SELECT number FROM numbers(${i * 10}, 10)`);
+		}
+		await run(a!, "CREATE TABLE big (k UInt64, s String) ENGINE = ObjectMergeTree ORDER BY k");
+		/// More than 8 MiB in its parts.
+		for (let i = 0; i < 6; ++i) {
+			await run(a!, `INSERT INTO big SELECT number, ${hashes} FROM numbers(${i * 4000}, 4000)`);
+		}
+		shards.count = 0;
+		expect(await run(a!, "SELECT count() FROM f INNER JOIN big ON f.k = big.k WHERE big.k < 5")).toBe("5\n");
+		expect(shards.count).toBe(0);
 	});
 
 	it("fails a query whose shards send back too much", async () => {

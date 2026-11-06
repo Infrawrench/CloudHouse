@@ -101,8 +101,9 @@ struct FanOutRequest
     String database;
     String table;
     String query;
-    /// The query reads other tables too, in a join or a subquery, which the shards read themselves.
-    bool other_tables = false;
+    /// The other sides of the joins and `IN`s of the query, which the coordinator has read, for the shards. See
+    /// `ObjectPartStore::encodeBroadcast`.
+    String broadcast;
 };
 
 class ObjectPartStore
@@ -151,6 +152,10 @@ public:
 
     /// Encodes blocks for the host, in the `Native` format, not compressed: the results of shards.
     static String encodeBlocks(const Blocks & blocks);
+    /// The tables of the query context of the coordinator that `query` for the shards reads, and the same tables in the
+    /// query context of a shard.
+    static String encodeBroadcast(const ContextPtr & context, std::string_view query);
+    static void addBroadcast(const ContextMutablePtr & context, std::string_view data);
     static Blocks decodeBlocks(std::string_view data);
 
 private:

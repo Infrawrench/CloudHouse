@@ -248,12 +248,18 @@ ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (kind, ts) TTL ts + INTERV
   parts, at most 16 shards. `ObjectMergeTree` builds the query for the shards as `StorageDistributed` does, the
   shards return their blocks in `Native`, and the queries that the planner splits (aggregation, `ORDER BY ...
   LIMIT`, `DISTINCT`) come out as on a cluster. A query that joins the table with another also fans out when this
-  table is the leftmost of its joins and the joins are `INNER` or `LEFT`: each shard joins its parts with the whole
-  of the other tables, which it reads itself, at the version of the catalog of the coordinator, so `prices` joined
-  with the small `instance_types` no longer reads `prices` in one engine. The rest read the table in one engine: `RIGHT`,
-  `FULL`, `PASTE`, `CROSS` and `ANY INNER` joins, which would give other rows split among shards; a query that reads the
-  table again (a self-join, `IN (SELECT ...)`), as a shard sees only its own parts; a query that reads a table of
-  `Memory`, a view or a table function, which a shard may not have; and a point query, which reads its few blocks.
+  table is the leftmost of its joins and the joins are `INNER` or `LEFT`. The coordinator reads the other side of each
+  join and `IN` once, with shards of its own if it is large, and sends its rows to the shards, compressed, as `GLOBAL
+  JOIN` does: each shard joins its parts with them. So `prices` joined with `instance_types`, with a view, with a table
+  of `Memory` or with a subquery on `prices` itself reads each of them once, and no shard needs them. The rows sent are
+  1 MiB at most, compressed (`max_broadcast_bytes`), as the Worker holds them once per shard while it sends them: past
+  that, the query fails with `TOO_MANY_ROWS_OR_BYTES`, and says to filter or aggregate that side in a subquery. The rest
+  read the table in one engine: a table of more than 8 MiB on the right with no subquery to filter it
+  (`max_broadcast_table_bytes`); `RIGHT`, `FULL`, `PASTE`, `CROSS` and `ANY INNER` joins, which would give other rows
+  split among shards; and a point query, which reads its few blocks. A change to what a coordinator asks of its shards
+  can't roll out in place: on 2026-11-06, after a deploy that added the rows sent, queries that sent them failed for
+  minutes on the objects that `KEEP_WARM_SECONDS` keeps running, and did not on a deployment without it. Deleting and
+  creating the namespace of `EngineHost`, which holds no data, takes 90 s and starts every object on the new code.
 - **Caching.** Engines read ranges of parts through `PartCache` (`src/cache.ts`), an entrypoint of the Worker behind
   Workers Caching, which works on `workers.dev` and in front of loopback calls: a part never changes, so an engine
   reads a range from the cache of its data center if another engine there has read it. The cache keeps the ranges, not
