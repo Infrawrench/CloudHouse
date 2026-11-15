@@ -584,8 +584,13 @@ export class Database {
 
 	/// Applies committed changes to the engine. The engine is at the new version only if no other commit came between:
 	/// otherwise the next query syncs.
+	///
+	/// `commitParts` applies after the lock has been free, so a query may have synced the engine to this commit or past
+	/// it meanwhile. Its tables have these parts then, and adding them again would list them twice, which no later sync
+	/// corrects while the catalog stays at that version.
 	private async apply(changes: CatalogChange[], version: number, io: Io): Promise<void> {
 		const current = this.state.version === version - 1;
+		const synced = this.state.version >= version;
 		const unused: string[] = [];
 		const changed = new Set<string>();
 		for (const change of changes) {
@@ -668,6 +673,11 @@ export class Database {
 					const table = this.state.tables.get(key);
 					/// Dropped since, by a commit that this engine has synced to.
 					if (table === undefined) {
+						break;
+					}
+					/// Already in the snapshot that the engine synced to; it may still want a merge.
+					if (synced) {
+						changed.add(key);
 						break;
 					}
 					const gone = new Set([...change.removed, ...change.detached]);
